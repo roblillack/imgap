@@ -213,9 +213,9 @@ fn build_diff_heatmap(img1: &DynamicImage, img2: &DynamicImage) -> RgbaImage {
         for x in 0..common_w {
             let i1 = ((y * w1 + x) * 4) as usize;
             let i2 = ((y * w2 + x) * 4) as usize;
-            let dr = (raw1[i1] as i16 - raw2[i2] as i16).unsigned_abs() as u16;
-            let dg = (raw1[i1 + 1] as i16 - raw2[i2 + 1] as i16).unsigned_abs() as u16;
-            let db = (raw1[i1 + 2] as i16 - raw2[i2 + 2] as i16).unsigned_abs() as u16;
+            let dr = (raw1[i1] as i16 - raw2[i2] as i16).unsigned_abs();
+            let dg = (raw1[i1 + 1] as i16 - raw2[i2 + 1] as i16).unsigned_abs();
+            let db = (raw1[i1 + 2] as i16 - raw2[i2 + 2] as i16).unsigned_abs();
             let diff = (77 * dr + 151 * dg + 28 * db) as f32 / (255.0 * 256.0);
             let pixel = heatmap_color(diff);
             let oi = ((y * diff_w + x) * 4) as usize;
@@ -275,20 +275,20 @@ fn detect_protocol() -> Protocol {
         }
     }
 
-    if let Ok(term) = env::var("TERM") {
-        if term.contains("kitty") {
-            return Protocol::Kitty;
-        }
+    if let Ok(term) = env::var("TERM")
+        && term.contains("kitty")
+    {
+        return Protocol::Kitty;
     }
 
     if env::var("KITTY_WINDOW_ID").is_ok() {
         return Protocol::Kitty;
     }
 
-    if let Ok(lc) = env::var("LC_TERMINAL") {
-        if lc == "iTerm2" {
-            return Protocol::Iterm2;
-        }
+    if let Ok(lc) = env::var("LC_TERMINAL")
+        && lc == "iTerm2"
+    {
+        return Protocol::Iterm2;
     }
     if env::var("ITERM_SESSION_ID").is_ok() {
         return Protocol::Iterm2;
@@ -366,7 +366,7 @@ fn write_sixel(img: &RgbaImage, w: &mut impl Write) -> io::Result<()> {
     }
 
     // Pre-compute which colors appear in each band to avoid scanning all 255 colors
-    let num_bands = ((height + 5) / 6) as usize;
+    let num_bands = height.div_ceil(6) as usize;
     let mut band_colors: Vec<Vec<u8>> = Vec::with_capacity(num_bands);
     for band in 0..num_bands {
         let y_start = (band as u32) * 6;
@@ -532,7 +532,9 @@ fn channel_range(pixels: &[(u8, u8, u8)]) -> u32 {
     rd.max(gd).max(bd)
 }
 
-fn split_bucket(mut pixels: Vec<(u8, u8, u8)>) -> (Vec<(u8, u8, u8)>, Vec<(u8, u8, u8)>) {
+type Rgb = (u8, u8, u8);
+
+fn split_bucket(mut pixels: Vec<Rgb>) -> (Vec<Rgb>, Vec<Rgb>) {
     let (mut rmin, mut rmax) = (255u8, 0u8);
     let (mut gmin, mut gmax) = (255u8, 0u8);
     let (mut bmin, mut bmax) = (255u8, 0u8);
