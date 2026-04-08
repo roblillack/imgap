@@ -50,17 +50,12 @@ fn main() {
 /// Query terminal size and return available pixel dimensions (width, height),
 /// reserving `reserve_rows` text rows at the bottom.
 fn terminal_pixel_size(reserve_rows: u16) -> (u32, u32) {
-    let (cols, rows, px_w, px_h) = get_terminal_dimensions();
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let cols = (cols as u32).max(1);
+    let rows = (rows as u32).max(1);
     let usable_rows = rows.saturating_sub(reserve_rows as u32);
 
-    if px_w > 0 && px_h > 0 {
-        // We have pixel dimensions — compute per-cell size and scale
-        let cell_h = px_h / rows.max(1);
-        let reserved_px = reserve_rows as u32 * cell_h;
-        return (px_w, px_h.saturating_sub(reserved_px).max(1));
-    }
-
-    // No pixel info from ioctl; try CSI 14t query
+    // Try CSI 14t query for actual pixel dimensions
     if let Some((qw, qh)) = query_pixel_size_csi() {
         let cell_h = qh / rows.max(1);
         let reserved_px = reserve_rows as u32 * cell_h;
@@ -71,86 +66,47 @@ fn terminal_pixel_size(reserve_rows: u16) -> (u32, u32) {
     (cols * 8, usable_rows * 16)
 }
 
-/// Get terminal dimensions from ioctl TIOCGWINSZ.
-/// Returns (cols, rows, pixel_width, pixel_height).
-fn get_terminal_dimensions() -> (u32, u32, u32, u32) {
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) != 0 {
-            return (80, 24, 0, 0);
-        }
-        (
-            (ws.ws_col as u32).max(1),
-            (ws.ws_row as u32).max(1),
-            ws.ws_xpixel as u32,
-            ws.ws_ypixel as u32,
-        )
-    }
-}
-
 /// Query terminal pixel size using xterm CSI 14t escape.
 /// Returns Some((width, height)) on success.
 fn query_pixel_size_csi() -> Option<(u32, u32)> {
-    use std::io::Read;
-    use std::os::unix::io::AsRawFd;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-    let stdin = io::stdin();
-    let fd = stdin.as_raw_fd();
-
-    // Save terminal settings and switch to raw mode
-    let orig = unsafe {
-        let mut t: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut t) != 0 {
-            return None;
-        }
-        t
-    };
-
-    let mut raw = orig;
-    raw.c_lflag &= !(libc::ICANON | libc::ECHO);
-    raw.c_cc[libc::VMIN] = 0;
-    raw.c_cc[libc::VTIME] = 1; // 100ms timeout
-    unsafe {
-        libc::tcsetattr(fd, libc::TCSANOW, &raw);
-    }
-
-    // Drain any pending input
-    let mut drain = [0u8; 256];
-    let _ = io::stdin().read(&mut drain);
+    crossterm::terminal::enable_raw_mode().ok()?;
 
     // Send CSI 14t (report text area pixel size)
     let _ = io::stderr().write_all(b"\x1b[14t");
     let _ = io::stderr().flush();
 
-    // Read response: ESC [ 4 ; <height> ; <width> t
-    let mut buf = [0u8; 64];
-    let mut pos = 0;
-    let mut attempts = 0;
-    while pos < buf.len() && attempts < 10 {
-        match io::stdin().read(&mut buf[pos..]) {
-            Ok(0) => {
-                attempts += 1;
-                continue;
-            }
-            Ok(n) => {
-                pos += n;
-                if buf[..pos].contains(&b't') {
-                    break;
+    // Read response in a background thread: crossterm's raw mode uses
+    // blocking reads, so if the terminal doesn't support this query
+    // the read would hang forever. The timeout lets us fall back gracefully.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 64];
+        let mut pos = 0;
+        while pos < buf.len() {
+            match io::stdin().read(&mut buf[pos..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pos += n;
+                    if buf[..pos].contains(&b't') {
+                        break;
+                    }
                 }
+                Err(_) => break,
             }
-            Err(_) => break,
         }
-        attempts += 1;
-    }
+        let _ = tx.send(buf[..pos].to_vec());
+    });
 
-    // Restore terminal
-    unsafe {
-        libc::tcsetattr(fd, libc::TCSANOW, &orig);
-    }
+    let response = rx.recv_timeout(Duration::from_millis(200)).ok();
+    let _ = crossterm::terminal::disable_raw_mode();
 
-    // Parse response
-    let resp = std::str::from_utf8(&buf[..pos]).ok()?;
-    // Find the CSI response: \x1b[4;<h>;<w>t
+    // Parse response: ESC [ 4 ; <height> ; <width> t
+    let data = response?;
+    let resp = std::str::from_utf8(&data).ok()?;
     let start = resp.find("[4;")?;
     let rest = &resp[start + 3..];
     let end = rest.find('t')?;
@@ -421,7 +377,9 @@ fn write_sixel(img: &RgbaImage, w: &mut impl Write) -> io::Result<()> {
                 seen[indexed[(y * width + x) as usize] as usize] = true;
             }
         }
-        let colors: Vec<u8> = (0..palette.len() as u8).filter(|&c| seen[c as usize]).collect();
+        let colors: Vec<u8> = (0..palette.len() as u8)
+            .filter(|&c| seen[c as usize])
+            .collect();
         band_colors.push(colors);
     }
 

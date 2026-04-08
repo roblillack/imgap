@@ -2,11 +2,18 @@
 name = "imgap"
 version = "0.1.0"
 edition = "2024"
+description = "Visualize differences between two images directly in your terminal"
+authors = ["Rob Lillack <rob@lillack.net>"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/roblillack/imgap"
+repository = "https://github.com/roblillack/imgap"
+documentation = "https://docs.rs/imgap"
 
 [dependencies]
 image = "0.25"
 base64 = "0.22"
-libc = "0.2"
+crossterm = "0.28"
 
 [profile.dev]
 opt-level = 2
