@@ -1,5 +1,10 @@
 # imgap
 
+[![Build Status](https://github.com/roblillack/imgap/workflows/build-lint-test/badge.svg)](https://github.com/roblillack/imgap/actions)
+[![Crates.io](https://img.shields.io/crates/v/imgap.svg)](https://crates.io/crates/imgap)
+[![Downloads](https://img.shields.io/crates/d/imgap.svg)](https://crates.io/crates/imgap)
+[![Docs.rs](https://docs.rs/imgap/badge.svg)](https://docs.rs/imgap)
+
 A command-line tool to visualize differences between two images, rendered directly in your terminal.
 
 ```
