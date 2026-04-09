@@ -6,11 +6,7 @@
 
 A command-line tool to visualize differences between two images, rendered directly in your terminal.
 
-```
- img1 (before) | img2 (after)
-─────────────────────────────
-         diff heatmap
-```
+![imgap example using showing the diff between two PNG files](screenshot.png)
 
 The diff heatmap shows pixel differences using a color scale: black (identical) through blue, green, yellow to red (maximum difference). Magenta indicates regions where images differ in size.
 
@@ -25,7 +21,7 @@ Supports PNG, JPG, WebP, GIF, BMP, TIFF, and other common formats.
 ## Install
 
 ```
-cargo install --path .
+cargo install imgap
 ```
 
 ## Terminal support
@@ -69,7 +65,7 @@ git config --global pager.diff lessi
 
 Now `git diff` will show visual image comparisons inline in your terminal.
 
-## Building
+## Building from source
 
 ```
 cargo build --release
