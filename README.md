@@ -60,6 +60,14 @@ In your repository (or globally in `~/.config/git/attributes`):
 *.gif diff=image
 ```
 
+### 3. Use an image-aware pager
+
+Git pipes diff output through a pager (typically `less`), which does not understand image escape sequences. To see inline images in `git diff`, use an image-aware pager like [lessi](https://github.com/roblillack/lessi):
+
+```sh
+git config --global pager.diff lessi
+```
+
 Now `git diff` will show visual image comparisons inline in your terminal.
 
 ## Building
