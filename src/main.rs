@@ -374,7 +374,10 @@ fn detect_protocol(renderer_override: Option<&str>) -> Protocol {
         if let Some(p) = parse_renderer(name) {
             return p;
         }
-        eprintln!("Unknown renderer '{}'. Valid: kitty, iterm2, sixel, ansi", name);
+        eprintln!(
+            "Unknown renderer '{}'. Valid: kitty, iterm2, sixel, ansi",
+            name
+        );
         process::exit(1);
     }
 
@@ -385,39 +388,47 @@ fn detect_protocol(renderer_override: Option<&str>) -> Protocol {
         return p;
     }
 
-    if let Ok(tp) = env::var("TERM_PROGRAM") {
-        if tp.to_lowercase().contains("kitty") {
+    let in_tmux = env::var("TMUX").is_ok();
+
+    // Inside tmux, Kitty and iTerm2 protocols are not forwarded.
+    // Only Sixel (tmux >= 3.4) and ANSI work.
+    if !in_tmux {
+        if let Ok(tp) = env::var("TERM_PROGRAM") {
+            if tp.to_lowercase().contains("kitty") {
+                return Protocol::Kitty;
+            }
+            if tp == "iTerm.app" || tp == "WezTerm" {
+                return Protocol::Iterm2;
+            }
+        }
+
+        if let Ok(term) = env::var("TERM")
+            && term.contains("kitty")
+        {
             return Protocol::Kitty;
         }
-        if tp == "iTerm.app" || tp == "WezTerm" {
+
+        if env::var("KITTY_WINDOW_ID").is_ok() {
+            return Protocol::Kitty;
+        }
+
+        if let Ok(lc) = env::var("LC_TERMINAL")
+            && lc == "iTerm2"
+        {
+            return Protocol::Iterm2;
+        }
+        if env::var("ITERM_SESSION_ID").is_ok() {
+            return Protocol::Iterm2;
+        }
+
+        if env::var("WEZTERM_EXECUTABLE").is_ok() {
             return Protocol::Iterm2;
         }
     }
 
-    if let Ok(term) = env::var("TERM")
-        && term.contains("kitty")
-    {
-        return Protocol::Kitty;
-    }
-
-    if env::var("KITTY_WINDOW_ID").is_ok() {
-        return Protocol::Kitty;
-    }
-
-    if let Ok(lc) = env::var("LC_TERMINAL")
-        && lc == "iTerm2"
-    {
-        return Protocol::Iterm2;
-    }
-    if env::var("ITERM_SESSION_ID").is_ok() {
-        return Protocol::Iterm2;
-    }
-
-    if env::var("WEZTERM_EXECUTABLE").is_ok() {
-        return Protocol::Iterm2;
-    }
-
-    // Probe for Sixel support via DA1 (Device Attributes) query
+    // Probe for Sixel support via DA1 (Device Attributes) query.
+    // This works both inside and outside tmux — tmux >= 3.4 will
+    // report Sixel capability if its own support is enabled.
     if query_sixel_support() {
         return Protocol::Sixel;
     }
