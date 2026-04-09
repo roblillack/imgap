@@ -92,6 +92,71 @@ fn terminal_pixel_size(reserve_rows: u16) -> (u32, u32) {
     (cols * 8, usable_rows * 16)
 }
 
+/// Open a direct read+write handle to the controlling terminal,
+/// bypassing stdin/stdout/stderr which may be redirected.
+fn open_tty() -> Option<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .ok()
+    }
+    #[cfg(windows)]
+    {
+        use std::fs::OpenOptions;
+        // On Windows, CONIN$ and CONOUT$ are separate; open CONOUT$ for write
+        // and CONIN$ for read. For simplicity we open CONIN$ read+write — the
+        // write end will target the console output.
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("CONIN$")
+            .ok()
+    }
+}
+
+/// Send an escape sequence query to the terminal and read the response.
+/// Uses /dev/tty (Unix) or CONIN$/CONOUT$ (Windows) so this works even when
+/// stdin/stdout/stderr are redirected (e.g. git external diff commands).
+fn query_terminal(query: &[u8], terminator: u8, timeout_ms: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let mut tty = open_tty()?;
+
+    crossterm::terminal::enable_raw_mode().ok()?;
+
+    tty.write_all(query).ok()?;
+    tty.flush().ok()?;
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 128];
+        let mut pos = 0;
+        while pos < buf.len() {
+            match tty.read(&mut buf[pos..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pos += n;
+                    if buf[..pos].contains(&terminator) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(buf[..pos].to_vec());
+    });
+
+    let response = rx.recv_timeout(Duration::from_millis(timeout_ms)).ok();
+    let _ = crossterm::terminal::disable_raw_mode();
+    response
+}
+
 /// Return terminal dimensions suitable for half-block text rendering.
 /// Each cell is 1 pixel wide and 2 pixels tall (using ▄).
 fn terminal_char_size(reserve_rows: u16) -> (u32, u32) {
@@ -103,43 +168,7 @@ fn terminal_char_size(reserve_rows: u16) -> (u32, u32) {
 /// Query terminal pixel size using xterm CSI 14t escape.
 /// Returns Some((width, height)) on success.
 fn query_pixel_size_csi() -> Option<(u32, u32)> {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    crossterm::terminal::enable_raw_mode().ok()?;
-
-    // Send CSI 14t (report text area pixel size)
-    let _ = io::stderr().write_all(b"\x1b[14t");
-    let _ = io::stderr().flush();
-
-    // Read response in a background thread: crossterm's raw mode uses
-    // blocking reads, so if the terminal doesn't support this query
-    // the read would hang forever. The timeout lets us fall back gracefully.
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = [0u8; 64];
-        let mut pos = 0;
-        while pos < buf.len() {
-            match io::stdin().read(&mut buf[pos..]) {
-                Ok(0) => break,
-                Ok(n) => {
-                    pos += n;
-                    if buf[..pos].contains(&b't') {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = tx.send(buf[..pos].to_vec());
-    });
-
-    let response = rx.recv_timeout(Duration::from_millis(200)).ok();
-    let _ = crossterm::terminal::disable_raw_mode();
-
-    // Parse response: ESC [ 4 ; <height> ; <width> t
-    let data = response?;
+    let data = query_terminal(b"\x1b[14t", b't', 200)?;
     let resp = std::str::from_utf8(&data).ok()?;
     let start = resp.find("[4;")?;
     let rest = &resp[start + 3..];
@@ -154,43 +183,7 @@ fn query_pixel_size_csi() -> Option<(u32, u32)> {
 /// Query Sixel support using DA1 (Device Attributes) escape sequence.
 /// Sends `ESC [ c` and checks if `4` (Sixel) appears among the reported attributes.
 fn query_sixel_support() -> bool {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    let Ok(()) = crossterm::terminal::enable_raw_mode() else {
-        return false;
-    };
-
-    // Send DA1 query
-    let _ = io::stderr().write_all(b"\x1b[c");
-    let _ = io::stderr().flush();
-
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = [0u8; 128];
-        let mut pos = 0;
-        while pos < buf.len() {
-            match io::stdin().read(&mut buf[pos..]) {
-                Ok(0) => break,
-                Ok(n) => {
-                    pos += n;
-                    if buf[..pos].contains(&b'c') {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = tx.send(buf[..pos].to_vec());
-    });
-
-    let response = rx.recv_timeout(Duration::from_millis(200)).ok();
-    let _ = crossterm::terminal::disable_raw_mode();
-
-    // Parse response: ESC [ ? <params> c
-    // Sixel support is indicated by parameter `4`
-    let data = match response {
+    let data = match query_terminal(b"\x1b[c", b'c', 200) {
         Some(d) => d,
         None => return false,
     };
