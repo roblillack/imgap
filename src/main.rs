@@ -7,14 +7,34 @@ use std::process;
 fn main() {
     let args: Vec<String> = env::args().collect();
 
+    // Extract optional -r <renderer> flag from arguments
+    let mut renderer_override: Option<String> = None;
+    let mut filtered_args: Vec<&str> = Vec::new();
+    let mut i = 1; // skip argv[0]
+    while i < args.len() {
+        if args[i] == "-r" {
+            if i + 1 < args.len() {
+                renderer_override = Some(args[i + 1].clone());
+                i += 2;
+                continue;
+            } else {
+                eprintln!("Error: -r requires a value (kitty, iterm2, sixel, ansi)");
+                process::exit(1);
+            }
+        }
+        filtered_args.push(&args[i]);
+        i += 1;
+    }
+
     // git diff external command passes 7 args:
     //   path old-file old-hex old-mode new-file new-hex new-mode
-    let (path1, path2) = if args.len() == 8 {
-        (args[2].as_str(), args[5].as_str())
-    } else if args.len() == 3 {
-        (args[1].as_str(), args[2].as_str())
+    let (path1, path2) = if filtered_args.len() == 7 {
+        (filtered_args[1], filtered_args[4])
+    } else if filtered_args.len() == 2 {
+        (filtered_args[0], filtered_args[1])
     } else {
-        eprintln!("Usage: imgap <image1> <image2>");
+        eprintln!("Usage: imgap [-r <renderer>] <image1> <image2>");
+        eprintln!("Renderers: kitty, iterm2, sixel, ansi");
         eprintln!("Also works as: git diff --ext-diff (via diff.*.command)");
         process::exit(1);
     };
@@ -28,18 +48,24 @@ fn main() {
         process::exit(1);
     });
 
-    // Get available terminal pixel area (reserving 3 rows for the prompt)
-    let (term_px_w, term_px_h) = terminal_pixel_size(5);
+    let protocol = detect_protocol(renderer_override.as_deref());
+
+    // For text mode each terminal cell is 1 char wide and 2 pixels tall (half-blocks),
+    // so compute dimensions differently than for graphics protocols.
+    let (term_px_w, term_px_h) = match protocol {
+        Protocol::Ansi => terminal_char_size(5),
+        _ => terminal_pixel_size(5),
+    };
 
     let comparison = build_comparison(&img1, &img2, term_px_w, term_px_h);
 
-    let protocol = detect_protocol();
     let stdout = io::stdout().lock();
     let mut w = BufWriter::new(stdout);
     match protocol {
         Protocol::Kitty => write_kitty(&comparison, &mut w),
         Protocol::Iterm2 => write_iterm2(&comparison, &mut w),
         Protocol::Sixel => write_sixel(&comparison, &mut w),
+        Protocol::Ansi => write_text(&comparison, &mut w),
     }
     .unwrap_or_else(|e| {
         eprintln!("Failed to write image: {}", e);
@@ -64,6 +90,14 @@ fn terminal_pixel_size(reserve_rows: u16) -> (u32, u32) {
 
     // Last resort: assume 8x16 cells
     (cols * 8, usable_rows * 16)
+}
+
+/// Return terminal dimensions suitable for half-block text rendering.
+/// Each cell is 1 pixel wide and 2 pixels tall (using ▄).
+fn terminal_char_size(reserve_rows: u16) -> (u32, u32) {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let usable_rows = (rows as u32).saturating_sub(reserve_rows as u32);
+    (cols as u32, usable_rows * 2)
 }
 
 /// Query terminal pixel size using xterm CSI 14t escape.
@@ -115,6 +149,64 @@ fn query_pixel_size_csi() -> Option<(u32, u32)> {
     let h: u32 = parts.next()?.parse().ok()?;
     let w: u32 = parts.next()?.parse().ok()?;
     Some((w, h))
+}
+
+/// Query Sixel support using DA1 (Device Attributes) escape sequence.
+/// Sends `ESC [ c` and checks if `4` (Sixel) appears among the reported attributes.
+fn query_sixel_support() -> bool {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let Ok(()) = crossterm::terminal::enable_raw_mode() else {
+        return false;
+    };
+
+    // Send DA1 query
+    let _ = io::stderr().write_all(b"\x1b[c");
+    let _ = io::stderr().flush();
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 128];
+        let mut pos = 0;
+        while pos < buf.len() {
+            match io::stdin().read(&mut buf[pos..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pos += n;
+                    if buf[..pos].contains(&b'c') {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(buf[..pos].to_vec());
+    });
+
+    let response = rx.recv_timeout(Duration::from_millis(200)).ok();
+    let _ = crossterm::terminal::disable_raw_mode();
+
+    // Parse response: ESC [ ? <params> c
+    // Sixel support is indicated by parameter `4`
+    let data = match response {
+        Some(d) => d,
+        None => return false,
+    };
+    let resp = match std::str::from_utf8(&data) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let start = match resp.find("[?") {
+        Some(i) => i + 2,
+        None => return false,
+    };
+    let end = match resp[start..].find('c') {
+        Some(i) => start + i,
+        None => return false,
+    };
+    resp[start..end].split(';').any(|p| p.trim() == "4")
 }
 
 /// Scale a DynamicImage to fit within max_w x max_h, preserving aspect ratio.
@@ -263,9 +355,36 @@ enum Protocol {
     Kitty,
     Iterm2,
     Sixel,
+    Ansi,
 }
 
-fn detect_protocol() -> Protocol {
+fn parse_renderer(name: &str) -> Option<Protocol> {
+    match name.to_lowercase().as_str() {
+        "kitty" => Some(Protocol::Kitty),
+        "iterm2" => Some(Protocol::Iterm2),
+        "sixel" => Some(Protocol::Sixel),
+        "ansi" => Some(Protocol::Ansi),
+        _ => None,
+    }
+}
+
+fn detect_protocol(renderer_override: Option<&str>) -> Protocol {
+    // -r flag takes highest priority
+    if let Some(name) = renderer_override {
+        if let Some(p) = parse_renderer(name) {
+            return p;
+        }
+        eprintln!("Unknown renderer '{}'. Valid: kitty, iterm2, sixel, ansi", name);
+        process::exit(1);
+    }
+
+    // Then environment variable
+    if let Ok(val) = env::var("IMGAP_RENDERER")
+        && let Some(p) = parse_renderer(&val)
+    {
+        return p;
+    }
+
     if let Ok(tp) = env::var("TERM_PROGRAM") {
         if tp.to_lowercase().contains("kitty") {
             return Protocol::Kitty;
@@ -298,7 +417,12 @@ fn detect_protocol() -> Protocol {
         return Protocol::Iterm2;
     }
 
-    Protocol::Sixel
+    // Probe for Sixel support via DA1 (Device Attributes) query
+    if query_sixel_support() {
+        return Protocol::Sixel;
+    }
+
+    Protocol::Ansi
 }
 
 fn encode_png(img: &RgbaImage) -> Vec<u8> {
@@ -447,6 +571,43 @@ fn write_sixel(img: &RgbaImage, w: &mut impl Write) -> io::Result<()> {
     w.write_all(&buf)?;
     writeln!(w)?;
     w.flush()
+}
+
+/// Render image as colored Unicode half-block characters (▄).
+/// Each terminal row encodes two pixel rows: background color for the top pixel,
+/// foreground color for the bottom pixel.
+fn write_text(img: &RgbaImage, w: &mut impl Write) -> io::Result<()> {
+    let (width, height) = img.dimensions();
+
+    for y in (0..height).step_by(2) {
+        for x in 0..width {
+            let top = img.get_pixel(x, y);
+            let bottom = if y + 1 < height {
+                img.get_pixel(x, y + 1)
+            } else {
+                top
+            };
+
+            let (tr, tg, tb) = blend_alpha_rgb(top);
+            let (br, bg, bb) = blend_alpha_rgb(bottom);
+
+            // ESC[48;2;R;G;Bm = background (top pixel)
+            // ESC[38;2;R;G;Bm = foreground (bottom pixel)
+            write!(w, "\x1b[48;2;{tr};{tg};{tb}m\x1b[38;2;{br};{bg};{bb}m▄")?;
+        }
+        writeln!(w, "\x1b[0m")?;
+    }
+    w.flush()
+}
+
+/// Blend RGBA pixel against a black background, returning opaque RGB.
+fn blend_alpha_rgb(pixel: &Rgba<u8>) -> (u8, u8, u8) {
+    let a = pixel[3] as f32 / 255.0;
+    (
+        (a * pixel[0] as f32) as u8,
+        (a * pixel[1] as f32) as u8,
+        (a * pixel[2] as f32) as u8,
+    )
 }
 
 fn build_palette(img: &RgbaImage, max_colors: usize) -> Vec<(u8, u8, u8)> {
