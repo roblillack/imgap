@@ -98,7 +98,7 @@ fn main() {
             let palette = SixelPalette::from_image(&comparison, 255);
             write_sixel(&comparison, &palette, &mut w)
         }
-        Protocol::Ansi => write_text(&comparison, &mut w),
+        Protocol::Ansi => write_text(&comparison, 0, &mut w),
     }
     .unwrap_or_else(|e| {
         eprintln!("Failed to write image: {}", e);
@@ -280,6 +280,8 @@ struct InteractiveCache {
     term_px_h: u32,
     /// Pixels per terminal cell row (graphics protocols) or 2 (ANSI half-block).
     cell_h: u32,
+    /// Pixels per terminal cell column (graphics protocols) or 1 (ANSI half-block).
+    cell_w: u32,
     scaled_a: RgbaImage,
     scaled_b: RgbaImage,
     /// Built once per resize for the Sixel protocol. Approximates onion-skin
@@ -298,13 +300,14 @@ fn compute_interactive_cache(
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let usable_rows = rows.saturating_sub(INTERACTIVE_RESERVE_ROWS).max(1);
 
-    let (term_px_w, term_px_h, cell_h) = match protocol {
-        Protocol::Ansi => (cols as u32, usable_rows as u32 * 2, 2u32),
+    let (term_px_w, term_px_h, cell_h, cell_w) = match protocol {
+        Protocol::Ansi => (cols as u32, usable_rows as u32 * 2, 2u32, 1u32),
         _ => {
             let (fw, fh) = query_pixel_size_csi().unwrap_or((cols as u32 * 8, rows as u32 * 16));
             let cell_h = (fh / rows.max(1) as u32).max(1);
+            let cell_w = (fw / cols.max(1) as u32).max(1);
             let usable_px_h = usable_rows as u32 * cell_h;
-            (fw, usable_px_h, cell_h)
+            (fw, usable_px_h, cell_h, cell_w)
         }
     };
 
@@ -324,6 +327,7 @@ fn compute_interactive_cache(
         term_px_w,
         term_px_h,
         cell_h,
+        cell_w,
         scaled_a,
         scaled_b,
         sixel_palette,
@@ -335,6 +339,14 @@ fn image_cell_rows(img_h: u32, protocol: &Protocol, cell_h: u32) -> u32 {
     match protocol {
         Protocol::Ansi => img_h.div_ceil(2),
         _ => img_h.div_ceil(cell_h).max(1),
+    }
+}
+
+/// Image width in terminal cell columns, given the composed image and cell pixel width.
+fn image_cell_cols(img_w: u32, protocol: &Protocol, cell_w: u32) -> u32 {
+    match protocol {
+        Protocol::Ansi => img_w.max(1),
+        _ => img_w.div_ceil(cell_w).max(1),
     }
 }
 
@@ -400,10 +412,12 @@ fn render_interactive_frame(
     };
     let dt_compose = t.elapsed();
 
-    // Vertically center the image within the usable rows region.
+    // Center the image within the usable rows region (vertical) and full width.
     let img_rows = image_cell_rows(composed.height(), protocol, c.cell_h);
     let top_pad = (c.usable_rows as u32).saturating_sub(img_rows) / 2;
-    write!(w, "\x1b[{};1H", top_pad + 1)?;
+    let img_cols = image_cell_cols(composed.width(), protocol, c.cell_w);
+    let left_pad = (c.cols as u32).saturating_sub(img_cols) / 2;
+    write!(w, "\x1b[{};{}H", top_pad + 1, left_pad + 1)?;
 
     let t = Instant::now();
     match protocol {
@@ -414,7 +428,7 @@ fn render_interactive_frame(
             let palette = c.sixel_palette.as_ref().expect("sixel palette cached");
             write_sixel(&composed, palette, w)?
         }
-        Protocol::Ansi => write_text(&composed, w)?,
+        Protocol::Ansi => write_text(&composed, left_pad, w)?,
     }
     let dt_render = t.elapsed();
 
@@ -1126,10 +1140,15 @@ fn write_sixel(img: &RgbaImage, palette: &SixelPalette, w: &mut impl Write) -> i
 /// Render image as colored Unicode half-block characters (▄).
 /// Each terminal row encodes two pixel rows: background color for the top pixel,
 /// foreground color for the bottom pixel.
-fn write_text(img: &RgbaImage, w: &mut impl Write) -> io::Result<()> {
+fn write_text(img: &RgbaImage, left_pad: u32, w: &mut impl Write) -> io::Result<()> {
     let (width, height) = img.dimensions();
 
-    for y in (0..height).step_by(2) {
+    for (row, y) in (0..height).step_by(2).enumerate() {
+        // Row 0's cursor column is set by the caller; later rows start at
+        // column 1 after the row-ending \r\n, so shift them right to match.
+        if left_pad > 0 && row > 0 {
+            write!(w, "\x1b[{}C", left_pad)?;
+        }
         for x in 0..width {
             let top = img.get_pixel(x, y);
             let bottom = if y + 1 < height {
