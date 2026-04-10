@@ -7,8 +7,9 @@ use std::process;
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Extract optional -r <renderer> flag from arguments
+    // Extract optional flags from arguments
     let mut renderer_override: Option<String> = None;
+    let mut interactive = false;
     let mut filtered_args: Vec<&str> = Vec::new();
     let mut i = 1; // skip argv[0]
     while i < args.len() {
@@ -22,6 +23,11 @@ fn main() {
                 process::exit(1);
             }
         }
+        if args[i] == "-i" {
+            interactive = true;
+            i += 1;
+            continue;
+        }
         filtered_args.push(&args[i]);
         i += 1;
     }
@@ -33,11 +39,24 @@ fn main() {
     } else if filtered_args.len() == 2 {
         (filtered_args[0], filtered_args[1])
     } else {
-        eprintln!("Usage: imgap [-r <renderer>] <image1> <image2>");
+        eprintln!("Usage: imgap [-r <renderer>] [-i] <image1> <image2>");
         eprintln!("Renderers: kitty, iterm2, sixel, ansi");
+        eprintln!("  -i  interactive TUI mode (swipe / onion-skin / 2-up)");
         eprintln!("Also works as: git diff --ext-diff (via diff.*.command)");
+        eprintln!("               git difftool (auto-enables interactive mode)");
         process::exit(1);
     };
+
+    // Auto-enable interactive mode when invoked via `git difftool`.
+    // Difftool exports LOCAL/REMOTE as env vars for the tool command,
+    // while `git diff` with an external driver sets GIT_DIFF_PATH_TOTAL instead.
+    if !interactive
+        && env::var("GIT_DIFF_PATH_TOTAL").is_err()
+        && env::var("LOCAL").is_ok()
+        && env::var("REMOTE").is_ok()
+    {
+        interactive = true;
+    }
 
     let img1 = image::open(path1).unwrap_or_else(|e| {
         eprintln!("Failed to open '{}': {}", path1, e);
@@ -49,6 +68,14 @@ fn main() {
     });
 
     let protocol = detect_protocol(renderer_override.as_deref());
+
+    if interactive {
+        run_interactive(&img1, &img2, &protocol).unwrap_or_else(|e| {
+            eprintln!("Interactive mode failed: {}", e);
+            process::exit(1);
+        });
+        return;
+    }
 
     // For text mode each terminal cell is 1 char wide and 2 pixels tall (half-blocks),
     // so compute dimensions differently than for graphics protocols.
@@ -71,6 +98,371 @@ fn main() {
         eprintln!("Failed to write image: {}", e);
         process::exit(1);
     });
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CompareMode {
+    TwoUp,
+    Swipe,
+    OnionSkin,
+    Left,
+    Right,
+}
+
+impl CompareMode {
+    /// Cycle to next comparison mode. Single-image modes are skipped;
+    /// they're only reachable via the `s` key.
+    fn next(self) -> Self {
+        match self {
+            Self::TwoUp => Self::Swipe,
+            Self::Swipe => Self::OnionSkin,
+            Self::OnionSkin => Self::TwoUp,
+            Self::Left | Self::Right => Self::TwoUp,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::TwoUp => "2-up",
+            Self::Swipe => "swipe",
+            Self::OnionSkin => "onion skin",
+            Self::Left => "left only",
+            Self::Right => "right only",
+        }
+    }
+    fn uses_slider(self) -> bool {
+        matches!(self, Self::Swipe | Self::OnionSkin)
+    }
+    fn is_single(self) -> bool {
+        matches!(self, Self::Left | Self::Right)
+    }
+}
+
+/// Lay out both images on a common canvas (max of both dimensions),
+/// so that identical pixel coordinates line up for swipe/onion comparison.
+fn normalize_pair(a: &DynamicImage, b: &DynamicImage) -> (RgbaImage, RgbaImage) {
+    let w = a.width().max(b.width());
+    let h = a.height().max(b.height());
+    let mut out_a = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 0]));
+    let mut out_b = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 0]));
+    image::imageops::overlay(&mut out_a, &a.to_rgba8(), 0, 0);
+    image::imageops::overlay(&mut out_b, &b.to_rgba8(), 0, 0);
+    (out_a, out_b)
+}
+
+/// Scale two same-sized images by the same factor to fit a bounding box.
+fn scale_pair(a: &RgbaImage, b: &RgbaImage, max_w: u32, max_h: u32) -> (RgbaImage, RgbaImage) {
+    let (w, h) = (a.width(), a.height());
+    if w <= max_w && h <= max_h {
+        return (a.clone(), b.clone());
+    }
+    let scale = (max_w as f64 / w as f64).min(max_h as f64 / h as f64);
+    let nw = ((w as f64 * scale) as u32).max(1);
+    let nh = ((h as f64 * scale) as u32).max(1);
+    (
+        image::imageops::resize(a, nw, nh, image::imageops::FilterType::Triangle),
+        image::imageops::resize(b, nw, nh, image::imageops::FilterType::Triangle),
+    )
+}
+
+fn compose_two_up(a: &RgbaImage, b: &RgbaImage, max_w: u32, max_h: u32) -> RgbaImage {
+    let sep = 4u32;
+    let half = max_w.saturating_sub(sep) / 2;
+    let sa = scale_rgba(a, half, max_h);
+    let sb = scale_rgba(b, half, max_h);
+    let th = sa.height().max(sb.height());
+    let canvas_w = sa.width() + sep + sb.width();
+    let mut canvas = RgbaImage::new(canvas_w, th);
+    let gray = Rgba([128, 128, 128, 255]);
+    for y in 0..th {
+        for x in sa.width()..(sa.width() + sep) {
+            canvas.put_pixel(x, y, gray);
+        }
+    }
+    let sa_w = sa.width();
+    image::imageops::overlay(&mut canvas, &sa, 0, 0);
+    image::imageops::overlay(&mut canvas, &sb, (sa_w + sep) as i64, 0);
+    canvas
+}
+
+fn compose_swipe(a: &RgbaImage, b: &RgbaImage, t: f32) -> RgbaImage {
+    let (w, h) = a.dimensions();
+    let split = ((w as f32) * t.clamp(0.0, 1.0)) as u32;
+    let mut out = a.clone();
+    for y in 0..h {
+        for x in split..w {
+            out.put_pixel(x, y, *b.get_pixel(x, y));
+        }
+        if split < w {
+            out.put_pixel(split, y, Rgba([255, 220, 0, 255]));
+        }
+    }
+    out
+}
+
+fn compose_onion(a: &RgbaImage, b: &RgbaImage, t: f32) -> RgbaImage {
+    let t = t.clamp(0.0, 1.0);
+    let inv = 1.0 - t;
+    let (w, h) = a.dimensions();
+    let mut out = RgbaImage::new(w, h);
+    let ra = a.as_raw();
+    let rb = b.as_raw();
+    let dst = out.as_mut();
+    let mut i = 0;
+    while i < ra.len() {
+        dst[i] = (ra[i] as f32 * inv + rb[i] as f32 * t) as u8;
+        dst[i + 1] = (ra[i + 1] as f32 * inv + rb[i + 1] as f32 * t) as u8;
+        dst[i + 2] = (ra[i + 2] as f32 * inv + rb[i + 2] as f32 * t) as u8;
+        dst[i + 3] = (ra[i + 3] as f32 * inv + rb[i + 3] as f32 * t) as u8;
+        i += 4;
+    }
+    out
+}
+
+fn draw_status_bar(
+    w: &mut impl Write,
+    cols: u16,
+    rows: u16,
+    slider: f32,
+    mode: CompareMode,
+) -> io::Result<()> {
+    let slider_row = rows.saturating_sub(2).max(1);
+    let help_row = rows.saturating_sub(1).max(1);
+
+    // Slider line
+    write!(w, "\x1b[{};1H\x1b[2K", slider_row + 1)?;
+    let pct = (slider * 100.0).round() as u32;
+    let label = format!(" {:3}%", pct);
+    let bar_width = (cols as usize).saturating_sub(label.len() + 2).max(10);
+    let pos = ((bar_width as f32) * slider) as usize;
+    let active = mode.uses_slider();
+    write!(w, "[")?;
+    for i in 0..bar_width {
+        if active && i == pos.min(bar_width - 1) {
+            write!(w, "\x1b[33m█\x1b[0m")?;
+        } else if active && i < pos {
+            write!(w, "=")?;
+        } else if active {
+            write!(w, "-")?;
+        } else {
+            write!(w, "·")?;
+        }
+    }
+    write!(w, "]{}", label)?;
+
+    // Help line
+    write!(w, "\x1b[{};1H\x1b[2K", help_row + 1)?;
+    write!(
+        w,
+        "mode: \x1b[1m{}\x1b[0m    \x1b[2m←/→ slider   m mode   q quit\x1b[0m",
+        mode.label()
+    )?;
+    Ok(())
+}
+
+struct InteractiveCache {
+    cols: u16,
+    rows: u16,
+    usable_rows: u16,
+    term_px_w: u32,
+    term_px_h: u32,
+    /// Pixels per terminal cell row (graphics protocols) or 2 (ANSI half-block).
+    cell_h: u32,
+    scaled_a: RgbaImage,
+    scaled_b: RgbaImage,
+}
+
+/// Reserve 3 bottom rows for spacer + slider + help.
+const INTERACTIVE_RESERVE_ROWS: u16 = 3;
+
+fn compute_interactive_cache(
+    img1: &DynamicImage,
+    img2: &DynamicImage,
+    protocol: &Protocol,
+) -> InteractiveCache {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let usable_rows = rows.saturating_sub(INTERACTIVE_RESERVE_ROWS).max(1);
+
+    let (term_px_w, term_px_h, cell_h) = match protocol {
+        Protocol::Ansi => (cols as u32, usable_rows as u32 * 2, 2u32),
+        _ => {
+            let (fw, fh) = query_pixel_size_csi().unwrap_or((cols as u32 * 8, rows as u32 * 16));
+            let cell_h = (fh / rows.max(1) as u32).max(1);
+            let usable_px_h = usable_rows as u32 * cell_h;
+            (fw, usable_px_h, cell_h)
+        }
+    };
+
+    let (na, nb) = normalize_pair(img1, img2);
+    let (scaled_a, scaled_b) = scale_pair(&na, &nb, term_px_w, term_px_h);
+
+    InteractiveCache {
+        cols,
+        rows,
+        usable_rows,
+        term_px_w,
+        term_px_h,
+        cell_h,
+        scaled_a,
+        scaled_b,
+    }
+}
+
+/// Image height in terminal cell rows, given the composed image and cell pixel height.
+fn image_cell_rows(img_h: u32, protocol: &Protocol, cell_h: u32) -> u32 {
+    match protocol {
+        Protocol::Ansi => img_h.div_ceil(2),
+        _ => img_h.div_ceil(cell_h).max(1),
+    }
+}
+
+fn render_interactive_frame(
+    img1: &DynamicImage,
+    img2: &DynamicImage,
+    cached: &mut Option<InteractiveCache>,
+    mode: CompareMode,
+    slider: f32,
+    protocol: &Protocol,
+    w: &mut impl Write,
+) -> io::Result<()> {
+    // Clear screen and home cursor.
+    write!(w, "\x1b[2J\x1b[H")?;
+    // Kitty: also delete any prior image placements.
+    if matches!(protocol, Protocol::Kitty) {
+        write!(w, "\x1b_Ga=d;\x1b\\")?;
+    }
+
+    if cached.is_none() {
+        *cached = Some(compute_interactive_cache(img1, img2, protocol));
+    }
+    let c = cached.as_ref().unwrap();
+
+    let composed = match mode {
+        CompareMode::TwoUp => compose_two_up(&c.scaled_a, &c.scaled_b, c.term_px_w, c.term_px_h),
+        CompareMode::Swipe => compose_swipe(&c.scaled_a, &c.scaled_b, slider),
+        CompareMode::OnionSkin => compose_onion(&c.scaled_a, &c.scaled_b, slider),
+        CompareMode::Left => c.scaled_a.clone(),
+        CompareMode::Right => c.scaled_b.clone(),
+    };
+
+    // Vertically center the image within the usable rows region.
+    let img_rows = image_cell_rows(composed.height(), protocol, c.cell_h);
+    let top_pad = (c.usable_rows as u32).saturating_sub(img_rows) / 2;
+    write!(w, "\x1b[{};1H", top_pad + 1)?;
+
+    match protocol {
+        Protocol::Kitty => write_kitty(&composed, w)?,
+        Protocol::Iterm2 => write_iterm2(&composed, w)?,
+        Protocol::Sixel => write_sixel(&composed, w)?,
+        Protocol::Ansi => write_text(&composed, w)?,
+    }
+
+    draw_status_bar(w, c.cols, c.rows, slider, mode)?;
+    w.flush()
+}
+
+fn run_interactive(
+    img1: &DynamicImage,
+    img2: &DynamicImage,
+    protocol: &Protocol,
+) -> io::Result<()> {
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use std::time::Duration;
+
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
+    crossterm::terminal::enable_raw_mode()?;
+    // Alt screen + hide cursor.
+    write!(out, "\x1b[?1049h\x1b[?25l")?;
+    out.flush()?;
+
+    let mut mode = CompareMode::Swipe;
+    // The last non-single comparison mode, so `m` can return to it
+    // after jumping into Left/Right via `s`.
+    let mut last_compare_mode = CompareMode::Swipe;
+    let mut slider: f32 = 0.5;
+    let mut cached: Option<InteractiveCache> = None;
+    let mut dirty = true;
+
+    let step = 0.02_f32;
+
+    let result: io::Result<()> = (|| loop {
+        if dirty {
+            render_interactive_frame(img1, img2, &mut cached, mode, slider, protocol, &mut out)?;
+            dirty = false;
+        }
+        if event::poll(Duration::from_millis(250))? {
+            match event::read()? {
+                Event::Key(k) => match k.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(());
+                    }
+                    KeyCode::Char('m') | KeyCode::Char('M') => {
+                        // From a single-image view, return to the last
+                        // comparison mode. Otherwise cycle comparison modes.
+                        mode = if mode.is_single() {
+                            last_compare_mode
+                        } else {
+                            let next = mode.next();
+                            last_compare_mode = next;
+                            next
+                        };
+                        dirty = true;
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        mode = match mode {
+                            CompareMode::Left => CompareMode::Right,
+                            CompareMode::Right => CompareMode::Left,
+                            other => {
+                                last_compare_mode = other;
+                                CompareMode::Left
+                            }
+                        };
+                        dirty = true;
+                    }
+                    KeyCode::Left => {
+                        let s = if k.modifiers.contains(KeyModifiers::SHIFT) {
+                            step * 5.0
+                        } else {
+                            step
+                        };
+                        slider = (slider - s).max(0.0);
+                        dirty = true;
+                    }
+                    KeyCode::Right => {
+                        let s = if k.modifiers.contains(KeyModifiers::SHIFT) {
+                            step * 5.0
+                        } else {
+                            step
+                        };
+                        slider = (slider + s).min(1.0);
+                        dirty = true;
+                    }
+                    KeyCode::Home => {
+                        slider = 0.0;
+                        dirty = true;
+                    }
+                    KeyCode::End => {
+                        slider = 1.0;
+                        dirty = true;
+                    }
+                    _ => {}
+                },
+                Event::Resize(_, _) => {
+                    cached = None;
+                    dirty = true;
+                }
+                _ => {}
+            }
+        }
+    })();
+
+    // Restore terminal state.
+    let _ = write!(out, "\x1b[?25h\x1b[?1049l");
+    let _ = out.flush();
+    let _ = crossterm::terminal::disable_raw_mode();
+    result
 }
 
 /// Query terminal size and return available pixel dimensions (width, height),
@@ -128,7 +520,13 @@ fn query_terminal(query: &[u8], terminator: u8, timeout_ms: u64) -> Option<Vec<u
 
     let mut tty = open_tty()?;
 
-    crossterm::terminal::enable_raw_mode().ok()?;
+    // Preserve existing raw-mode state: if we're already in raw mode
+    // (e.g. inside the interactive TUI loop), don't disable it on the
+    // way out — that would unexpectedly re-enable line buffering.
+    let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !was_raw {
+        crossterm::terminal::enable_raw_mode().ok()?;
+    }
 
     tty.write_all(query).ok()?;
     tty.flush().ok()?;
@@ -153,7 +551,9 @@ fn query_terminal(query: &[u8], terminator: u8, timeout_ms: u64) -> Option<Vec<u
     });
 
     let response = rx.recv_timeout(Duration::from_millis(timeout_ms)).ok();
-    let _ = crossterm::terminal::disable_raw_mode();
+    if !was_raw {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
     response
 }
 
