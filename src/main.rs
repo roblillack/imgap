@@ -1141,7 +1141,10 @@ fn write_text(img: &RgbaImage, w: &mut impl Write) -> io::Result<()> {
             // ESC[38;2;R;G;Bm = foreground (bottom pixel)
             write!(w, "\x1b[48;2;{tr};{tg};{tb}m\x1b[38;2;{br};{bg};{bb}m▄")?;
         }
-        writeln!(w, "\x1b[0m")?;
+        // Use an explicit CR+LF — in raw mode OPOST is off, so a bare \n
+        // would only move the cursor down and leave the column where the
+        // last glyph landed, skewing every other row.
+        write!(w, "\x1b[0m\r\n")?;
     }
     w.flush()
 }
