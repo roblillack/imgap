@@ -315,7 +315,7 @@ fn compute_interactive_cache(
     let (scaled_a, scaled_b) = scale_pair(&na, &nb, term_px_w, term_px_h);
 
     let sixel_palette = if matches!(protocol, Protocol::Sixel) {
-        Some(SixelPalette::from_images(&[&scaled_a, &scaled_b], 255))
+        Some(SixelPalette::from_images(&[&scaled_a, &scaled_b], 64))
     } else {
         None
     };
@@ -476,7 +476,9 @@ fn run_interactive(
     use std::time::Duration;
 
     let stdout = io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
+    // Larger-than-default buffer so sixel/kitty frames go out in fewer
+    // write() syscalls instead of many 8 KiB chunks.
+    let mut out = BufWriter::with_capacity(128 * 1024, stdout.lock());
 
     crossterm::terminal::enable_raw_mode()?;
     // Alt screen + hide cursor.
