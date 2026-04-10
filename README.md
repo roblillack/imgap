@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/imgap.svg)](https://crates.io/crates/imgap)
 [![Downloads](https://img.shields.io/crates/d/imgap.svg)](https://crates.io/crates/imgap)
 
-A command-line tool to visualize differences between two images, rendered directly in your terminal.
+A command-line tool to visualize (Git?) differences between two images, rendered directly in your terminal.
 
 ![imgap example using showing the diff between two PNG files](screenshot.png)
 
@@ -25,6 +25,8 @@ Pass `-i` for a full-screen TUI that overlays the two images with a keyboard-dri
 ```
 imgap -i <image1> <image2>
 ```
+
+![imgap demo showing interactive mode](demo.gif)
 
 - `←` / `→` — move the slider (hold `Shift` for bigger steps)
 - `m` — cycle comparison modes: **2-up**, **swipe**, **onion skin**
