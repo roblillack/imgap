@@ -409,6 +409,7 @@ fn render_interactive_frame(
     slider: f32,
     protocol: &Protocol,
     sixel_colors: usize,
+    full_redraw: bool,
     w: &mut impl Write,
     stats: &mut FrameStats,
 ) -> io::Result<()> {
@@ -464,12 +465,18 @@ fn render_interactive_frame(
     draw_status_bar(&mut frame, c.cols, c.rows, slider, mode)?;
     let dt_status = t.elapsed();
 
-    // Clear the screen and emit the pre-rendered frame in a single flush.
+    // Clear the screen (or skip it for in-place updates) and emit the
+    // pre-rendered frame in a single flush. For Sixel/ANSI we can overwrite
+    // the previous image exactly as long as the layout is unchanged — no
+    // resize, no mode switch — which avoids the flicker of a full clear.
     let t = Instant::now();
-    w.write_all(b"\x1b[2J\x1b[H")?;
-    // Kitty: also delete any prior image placements.
-    if matches!(protocol, Protocol::Kitty) {
-        w.write_all(b"\x1b_Ga=d;\x1b\\")?;
+    let skip_clear = !full_redraw && matches!(protocol, Protocol::Sixel | Protocol::Ansi);
+    if !skip_clear {
+        w.write_all(b"\x1b[2J\x1b[H")?;
+        // Kitty: also delete any prior image placements.
+        if matches!(protocol, Protocol::Kitty) {
+            w.write_all(b"\x1b_Ga=d;\x1b\\")?;
+        }
     }
     let dt_clear = t.elapsed();
 
@@ -524,6 +531,9 @@ fn run_interactive(
     let mut last_compare_mode = CompareMode::Swipe;
     let mut slider: f32 = 0.5;
     let mut cached: Option<InteractiveCache> = None;
+    // None until the first successful render, and reset on resize so the
+    // next frame forces a full clear.
+    let mut last_rendered_mode: Option<CompareMode> = None;
     let mut dirty = true;
     let mut stats = FrameStats::default();
     let profile = env::var("IMGAP_PROFILE").is_ok();
@@ -534,6 +544,7 @@ fn run_interactive(
     let result: io::Result<()> = (|| {
         while !quit {
             if dirty {
+                let full_redraw = cached.is_none() || last_rendered_mode != Some(mode);
                 render_interactive_frame(
                     img1,
                     img2,
@@ -542,9 +553,11 @@ fn run_interactive(
                     slider,
                     protocol,
                     sixel_colors,
+                    full_redraw,
                     &mut out,
                     &mut stats,
                 )?;
+                last_rendered_mode = Some(mode);
                 dirty = false;
             }
 
@@ -617,6 +630,7 @@ fn run_interactive(
                     },
                     Event::Resize(_, _) => {
                         cached = None;
+                        last_rendered_mode = None;
                         dirty = true;
                     }
                     _ => {}
