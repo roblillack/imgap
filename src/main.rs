@@ -470,85 +470,103 @@ fn run_interactive(
 
     let step = 0.02_f32;
 
-    let result: io::Result<()> = (|| loop {
-        if dirty {
-            render_interactive_frame(
-                img1,
-                img2,
-                &mut cached,
-                mode,
-                slider,
-                protocol,
-                &mut out,
-                &mut stats,
-            )?;
-            dirty = false;
-        }
-        if event::poll(Duration::from_millis(250))? {
-            match event::read()? {
-                Event::Key(k) => match k.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(());
-                    }
-                    KeyCode::Char('m') | KeyCode::Char('M') => {
-                        // From a single-image view, return to the last
-                        // comparison mode. Otherwise cycle comparison modes.
-                        mode = if mode.is_single() {
-                            last_compare_mode
-                        } else {
-                            let next = mode.next();
-                            last_compare_mode = next;
-                            next
-                        };
-                        dirty = true;
-                    }
-                    KeyCode::Char('s') | KeyCode::Char('S') => {
-                        mode = match mode {
-                            CompareMode::Left => CompareMode::Right,
-                            CompareMode::Right => CompareMode::Left,
-                            other => {
-                                last_compare_mode = other;
-                                CompareMode::Left
-                            }
-                        };
-                        dirty = true;
-                    }
-                    KeyCode::Left => {
-                        let s = if k.modifiers.contains(KeyModifiers::SHIFT) {
-                            step * 5.0
-                        } else {
-                            step
-                        };
-                        slider = (slider - s).max(0.0);
-                        dirty = true;
-                    }
-                    KeyCode::Right => {
-                        let s = if k.modifiers.contains(KeyModifiers::SHIFT) {
-                            step * 5.0
-                        } else {
-                            step
-                        };
-                        slider = (slider + s).min(1.0);
-                        dirty = true;
-                    }
-                    KeyCode::Home => {
-                        slider = 0.0;
-                        dirty = true;
-                    }
-                    KeyCode::End => {
-                        slider = 1.0;
+    let mut quit = false;
+    let result: io::Result<()> = (|| {
+        while !quit {
+            if dirty {
+                render_interactive_frame(
+                    img1,
+                    img2,
+                    &mut cached,
+                    mode,
+                    slider,
+                    protocol,
+                    &mut out,
+                    &mut stats,
+                )?;
+                dirty = false;
+            }
+
+            // Block for the next event…
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
+
+            // …then drain any other events already queued (e.g. key-repeat
+            // from holding ←/→) so we coalesce them into a single render.
+            loop {
+                match event::read()? {
+                    Event::Key(k) => match k.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            quit = true;
+                            break;
+                        }
+                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            quit = true;
+                            break;
+                        }
+                        KeyCode::Char('m') | KeyCode::Char('M') => {
+                            mode = if mode.is_single() {
+                                last_compare_mode
+                            } else {
+                                let next = mode.next();
+                                last_compare_mode = next;
+                                next
+                            };
+                            dirty = true;
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            mode = match mode {
+                                CompareMode::Left => CompareMode::Right,
+                                CompareMode::Right => CompareMode::Left,
+                                other => {
+                                    last_compare_mode = other;
+                                    CompareMode::Left
+                                }
+                            };
+                            dirty = true;
+                        }
+                        KeyCode::Left => {
+                            let s = if k.modifiers.contains(KeyModifiers::SHIFT) {
+                                step * 5.0
+                            } else {
+                                step
+                            };
+                            slider = (slider - s).max(0.0);
+                            dirty = true;
+                        }
+                        KeyCode::Right => {
+                            let s = if k.modifiers.contains(KeyModifiers::SHIFT) {
+                                step * 5.0
+                            } else {
+                                step
+                            };
+                            slider = (slider + s).min(1.0);
+                            dirty = true;
+                        }
+                        KeyCode::Home => {
+                            slider = 0.0;
+                            dirty = true;
+                        }
+                        KeyCode::End => {
+                            slider = 1.0;
+                            dirty = true;
+                        }
+                        _ => {}
+                    },
+                    Event::Resize(_, _) => {
+                        cached = None;
                         dirty = true;
                     }
                     _ => {}
-                },
-                Event::Resize(_, _) => {
-                    cached = None;
-                    dirty = true;
                 }
-                _ => {}
+                // Stop draining as soon as the queue is empty.
+                if !event::poll(Duration::from_millis(0))? {
+                    break;
+                }
             }
         }
+        Ok(())
     })();
 
     // Restore terminal state.
