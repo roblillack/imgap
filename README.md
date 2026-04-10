@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/imgap.svg)](https://crates.io/crates/imgap)
 [![Downloads](https://img.shields.io/crates/d/imgap.svg)](https://crates.io/crates/imgap)
 
-A command-line tool to visualize differences between two images, rendered directly in your terminal.
+A command-line tool to visualize (Git?) differences between two images, rendered directly in your terminal.
 
 ![imgap example using showing the diff between two PNG files](screenshot.png)
 
@@ -17,6 +17,45 @@ imgap <image1> <image2>
 ```
 
 Supports PNG, JPG, WebP, GIF, BMP, TIFF, and other common formats.
+
+### Interactive mode
+
+Pass `-i` for a full-screen TUI that overlays the two images with a keyboard-driven slider:
+
+```
+imgap -i <image1> <image2>
+```
+
+![imgap demo showing interactive mode](demo.gif)
+
+- `←` / `→` — move the slider (hold `Shift` for bigger steps)
+- `m` — cycle comparison modes: **2-up**, **swipe**, **onion skin**
+- `s` — swap to the left-only view; press again for right-only; `m` returns to the last comparison mode
+- `Home` / `End` — jump to 0% / 100%
+- `q` / `Esc` — quit
+
+## Using with git difftool
+
+### If you also use imgap as a `git diff` driver
+
+Once `diff.image.command` is configured (see [Using with git diff](#using-with-git-diff) below), `git difftool` works out of the box. imgap automatically enters interactive mode when git invokes it through difftool (it checks for `GIT_DIFFTOOL_TRUST_EXIT_CODE` in the environment), so plain `git diff` stays inline and static while `git difftool` pops the interactive TUI:
+
+```sh
+git difftool -- '**/*.png'
+```
+
+### Standalone difftool
+
+If you don't want the `git diff` integration, register imgap as a named difftool instead:
+
+```sh
+git config --global difftool.imgap.cmd 'imgap -i "$LOCAL" "$REMOTE"'
+git config --global difftool.prompt false
+
+git difftool -t imgap -- '**/*.png'
+```
+
+Either way, difftool opens each modified image in the interactive TUI one after another — press `q` to advance to the next file.
 
 ## Install
 
@@ -34,7 +73,7 @@ imgap auto-detects your terminal's image protocol:
 
 ## Using with git diff
 
-imgap natively understands git's external diff calling convention -- no wrapper script needed.
+imgap also natively understands git's external diff calling convention (for the inline, non-interactive view) -- no wrapper script needed.
 
 ### 1. Configure git
 

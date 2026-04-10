@@ -1,5 +1,4 @@
 use image::{DynamicImage, Rgba, RgbaImage};
-use std::collections::HashMap;
 use std::env;
 use std::io::{self, BufWriter, Write};
 use std::process;
@@ -7,8 +6,13 @@ use std::process;
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Extract optional -r <renderer> flag from arguments
+    // Extract optional flags from arguments
     let mut renderer_override: Option<String> = None;
+    let mut interactive = false;
+    // Sixel palette depth in bits (1..=8): palette size = 1 << depth.
+    // Default 8 → 256 colors; lower values shrink the payload and speed up
+    // encoding/flush at the cost of some color fidelity.
+    let mut sixel_depth: u32 = 8;
     let mut filtered_args: Vec<&str> = Vec::new();
     let mut i = 1; // skip argv[0]
     while i < args.len() {
@@ -22,33 +26,81 @@ fn main() {
                 process::exit(1);
             }
         }
+        if args[i] == "-i" {
+            interactive = true;
+            i += 1;
+            continue;
+        }
+        // Accept `-d N` or `-d=N`.
+        if let Some(val) = args[i]
+            .strip_prefix("-d=")
+            .map(str::to_string)
+            .or_else(|| (args[i] == "-d" && i + 1 < args.len()).then(|| args[i + 1].clone()))
+        {
+            match val.parse::<u32>() {
+                Ok(d) if (1..=8).contains(&d) => sixel_depth = d,
+                _ => {
+                    eprintln!("Error: -d requires an integer in 1..=8");
+                    process::exit(1);
+                }
+            }
+            i += if args[i] == "-d" { 2 } else { 1 };
+            continue;
+        }
         filtered_args.push(&args[i]);
         i += 1;
     }
+    let sixel_colors: usize = 1usize << sixel_depth;
 
-    // git diff external command passes 7 args:
-    //   path old-file old-hex old-mode new-file new-hex new-mode
-    let (path1, path2) = if filtered_args.len() == 7 {
-        (filtered_args[1], filtered_args[4])
+    // Resolve the two image paths. In priority order:
+    //   1. `git diff --ext-diff` / `git difftool` (via `diff.*.command`) pass
+    //      7 args: path old-file old-hex old-mode new-file new-hex new-mode
+    //   2. Two positional arguments: <image1> <image2>
+    //   3. No positional args + LOCAL/REMOTE env vars, which `git difftool`
+    //      exports when the tool is registered via `difftool.*.cmd`.
+    let (path1, path2): (String, String) = if filtered_args.len() == 7 {
+        (filtered_args[1].to_string(), filtered_args[4].to_string())
     } else if filtered_args.len() == 2 {
-        (filtered_args[0], filtered_args[1])
+        (filtered_args[0].to_string(), filtered_args[1].to_string())
+    } else if filtered_args.is_empty()
+        && let (Ok(local), Ok(remote)) = (env::var("LOCAL"), env::var("REMOTE"))
+    {
+        (local, remote)
     } else {
-        eprintln!("Usage: imgap [-r <renderer>] <image1> <image2>");
+        eprintln!("Usage: imgap [-r <renderer>] [-i] [-d <1..8>] <image1> <image2>");
         eprintln!("Renderers: kitty, iterm2, sixel, ansi");
+        eprintln!("  -i  interactive TUI mode (swipe / onion-skin / 2-up)");
+        eprintln!("  -d  sixel palette depth in bits (1..8, default 8 → 256 colors)");
         eprintln!("Also works as: git diff --ext-diff (via diff.*.command)");
+        eprintln!("               git difftool (auto-enables interactive mode)");
         process::exit(1);
     };
 
-    let img1 = image::open(path1).unwrap_or_else(|e| {
+    // Auto-enable interactive mode when invoked via `git difftool`.
+    // `git-difftool--helper` sets GIT_DIFFTOOL_TRUST_EXIT_CODE in the env of
+    // the external diff command; plain `git diff` does not set it.
+    if !interactive && env::var("GIT_DIFFTOOL_TRUST_EXIT_CODE").is_ok() {
+        interactive = true;
+    }
+
+    let img1 = image::open(&path1).unwrap_or_else(|e| {
         eprintln!("Failed to open '{}': {}", path1, e);
         process::exit(1);
     });
-    let img2 = image::open(path2).unwrap_or_else(|e| {
+    let img2 = image::open(&path2).unwrap_or_else(|e| {
         eprintln!("Failed to open '{}': {}", path2, e);
         process::exit(1);
     });
 
     let protocol = detect_protocol(renderer_override.as_deref());
+
+    if interactive {
+        run_interactive(&img1, &img2, &protocol, sixel_colors).unwrap_or_else(|e| {
+            eprintln!("Interactive mode failed: {}", e);
+            process::exit(1);
+        });
+        return;
+    }
 
     // For text mode each terminal cell is 1 char wide and 2 pixels tall (half-blocks),
     // so compute dimensions differently than for graphics protocols.
@@ -64,13 +116,570 @@ fn main() {
     match protocol {
         Protocol::Kitty => write_kitty(&comparison, &mut w),
         Protocol::Iterm2 => write_iterm2(&comparison, &mut w),
-        Protocol::Sixel => write_sixel(&comparison, &mut w),
-        Protocol::Ansi => write_text(&comparison, &mut w),
+        Protocol::Sixel => {
+            let palette = SixelPalette::from_image(&comparison, sixel_colors);
+            write_sixel(&comparison, &palette, &mut w)
+        }
+        Protocol::Ansi => write_text(&comparison, 0, &mut w),
     }
     .unwrap_or_else(|e| {
         eprintln!("Failed to write image: {}", e);
         process::exit(1);
     });
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CompareMode {
+    TwoUp,
+    Swipe,
+    OnionSkin,
+    Left,
+    Right,
+}
+
+impl CompareMode {
+    /// Cycle to next comparison mode. Single-image modes are skipped;
+    /// they're only reachable via the `s` key.
+    fn next(self) -> Self {
+        match self {
+            Self::TwoUp => Self::Swipe,
+            Self::Swipe => Self::OnionSkin,
+            Self::OnionSkin => Self::TwoUp,
+            Self::Left | Self::Right => Self::TwoUp,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::TwoUp => "2-up",
+            Self::Swipe => "swipe",
+            Self::OnionSkin => "onion skin",
+            Self::Left => "left only",
+            Self::Right => "right only",
+        }
+    }
+    fn uses_slider(self) -> bool {
+        matches!(self, Self::Swipe | Self::OnionSkin)
+    }
+    fn is_single(self) -> bool {
+        matches!(self, Self::Left | Self::Right)
+    }
+}
+
+/// Lay out both images on a common canvas (max of both dimensions),
+/// so that identical pixel coordinates line up for swipe/onion comparison.
+fn normalize_pair(a: &DynamicImage, b: &DynamicImage) -> (RgbaImage, RgbaImage) {
+    let w = a.width().max(b.width());
+    let h = a.height().max(b.height());
+    let mut out_a = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 0]));
+    let mut out_b = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 0]));
+    image::imageops::overlay(&mut out_a, &a.to_rgba8(), 0, 0);
+    image::imageops::overlay(&mut out_b, &b.to_rgba8(), 0, 0);
+    (out_a, out_b)
+}
+
+/// Scale two same-sized images by the same factor to fit a bounding box.
+fn scale_pair(a: &RgbaImage, b: &RgbaImage, max_w: u32, max_h: u32) -> (RgbaImage, RgbaImage) {
+    let (w, h) = (a.width(), a.height());
+    if w <= max_w && h <= max_h {
+        return (a.clone(), b.clone());
+    }
+    let scale = (max_w as f64 / w as f64).min(max_h as f64 / h as f64);
+    let nw = ((w as f64 * scale) as u32).max(1);
+    let nh = ((h as f64 * scale) as u32).max(1);
+    (
+        image::imageops::resize(a, nw, nh, image::imageops::FilterType::Triangle),
+        image::imageops::resize(b, nw, nh, image::imageops::FilterType::Triangle),
+    )
+}
+
+fn compose_two_up(a: &RgbaImage, b: &RgbaImage, max_w: u32, max_h: u32) -> RgbaImage {
+    let sep = 4u32;
+    let half = max_w.saturating_sub(sep) / 2;
+    let sa = scale_rgba(a, half, max_h);
+    let sb = scale_rgba(b, half, max_h);
+    let th = sa.height().max(sb.height());
+    let canvas_w = sa.width() + sep + sb.width();
+    let mut canvas = RgbaImage::new(canvas_w, th);
+    let gray = Rgba([128, 128, 128, 255]);
+    for y in 0..th {
+        for x in sa.width()..(sa.width() + sep) {
+            canvas.put_pixel(x, y, gray);
+        }
+    }
+    let sa_w = sa.width();
+    image::imageops::overlay(&mut canvas, &sa, 0, 0);
+    image::imageops::overlay(&mut canvas, &sb, (sa_w + sep) as i64, 0);
+    canvas
+}
+
+fn compose_swipe(a: &RgbaImage, b: &RgbaImage, t: f32) -> RgbaImage {
+    let (w, h) = a.dimensions();
+    let split = ((w as f32) * t.clamp(0.0, 1.0)) as u32;
+    let row_bytes = (w * 4) as usize;
+    let split_bytes = (split * 4) as usize;
+    let ra = a.as_raw();
+    let rb = b.as_raw();
+    let mut out = vec![0u8; ra.len()];
+    // Row-wise slice copy: left half from `a`, right half from `b`.
+    for y in 0..(h as usize) {
+        let base = y * row_bytes;
+        let mid = base + split_bytes;
+        let end = base + row_bytes;
+        out[base..mid].copy_from_slice(&ra[base..mid]);
+        out[mid..end].copy_from_slice(&rb[mid..end]);
+        // Draw 1px yellow divider where the split lands.
+        if split < w {
+            let off = base + split_bytes;
+            out[off] = 255;
+            out[off + 1] = 220;
+            out[off + 2] = 0;
+            out[off + 3] = 255;
+        }
+    }
+    RgbaImage::from_raw(w, h, out).expect("swipe buffer size matches")
+}
+
+fn compose_onion(a: &RgbaImage, b: &RgbaImage, t: f32) -> RgbaImage {
+    let t = (t.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+    let inv = 255 - t;
+    let (w, h) = a.dimensions();
+    let ra = a.as_raw();
+    let rb = b.as_raw();
+    let mut out = vec![0u8; ra.len()];
+    // Integer blend: (a*(255-t) + b*t + 127) / 255, applied to all channels.
+    for i in 0..ra.len() {
+        out[i] = ((ra[i] as u32 * inv + rb[i] as u32 * t + 127) / 255) as u8;
+    }
+    RgbaImage::from_raw(w, h, out).expect("onion buffer size matches")
+}
+
+fn draw_status_bar(
+    w: &mut impl Write,
+    cols: u16,
+    rows: u16,
+    slider: f32,
+    mode: CompareMode,
+) -> io::Result<()> {
+    let slider_row = rows.saturating_sub(2).max(1);
+    let help_row = rows.saturating_sub(1).max(1);
+
+    // Slider line
+    write!(w, "\x1b[{};1H\x1b[2K", slider_row + 1)?;
+    let pct = (slider * 100.0).round() as u32;
+    let label = format!(" {:3}%", pct);
+    let bar_width = (cols as usize).saturating_sub(label.len() + 2).max(10);
+    let pos = ((bar_width as f32) * slider) as usize;
+    let active = mode.uses_slider();
+    write!(w, "[")?;
+    for i in 0..bar_width {
+        if active && i == pos.min(bar_width - 1) {
+            write!(w, "\x1b[33m█\x1b[0m")?;
+        } else if active && i < pos {
+            write!(w, "=")?;
+        } else if active {
+            write!(w, "-")?;
+        } else {
+            write!(w, "·")?;
+        }
+    }
+    write!(w, "]{}", label)?;
+
+    // Help line
+    write!(w, "\x1b[{};1H\x1b[2K", help_row + 1)?;
+    write!(
+        w,
+        "mode: \x1b[1m{}\x1b[0m    \x1b[2m←/→ slider   m mode   q quit\x1b[0m",
+        mode.label()
+    )?;
+    Ok(())
+}
+
+struct InteractiveCache {
+    cols: u16,
+    rows: u16,
+    usable_rows: u16,
+    term_px_w: u32,
+    term_px_h: u32,
+    /// Pixels per terminal cell row (graphics protocols) or 2 (ANSI half-block).
+    cell_h: u32,
+    /// Pixels per terminal cell column (graphics protocols) or 1 (ANSI half-block).
+    cell_w: u32,
+    scaled_a: RgbaImage,
+    scaled_b: RgbaImage,
+    /// Built once per resize for the Sixel protocol. Approximates onion-skin
+    /// blend colors via nearest-color lookup.
+    sixel_palette: Option<SixelPalette>,
+}
+
+/// Reserve 3 bottom rows for spacer + slider + help.
+const INTERACTIVE_RESERVE_ROWS: u16 = 3;
+
+fn compute_interactive_cache(
+    img1: &DynamicImage,
+    img2: &DynamicImage,
+    protocol: &Protocol,
+    sixel_colors: usize,
+) -> InteractiveCache {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let usable_rows = rows.saturating_sub(INTERACTIVE_RESERVE_ROWS).max(1);
+
+    let (term_px_w, term_px_h, cell_h, cell_w) = match protocol {
+        Protocol::Ansi => (cols as u32, usable_rows as u32 * 2, 2u32, 1u32),
+        _ => {
+            let (fw, fh) = query_pixel_size_csi().unwrap_or((cols as u32 * 8, rows as u32 * 16));
+            let cell_h = (fh / rows.max(1) as u32).max(1);
+            let cell_w = (fw / cols.max(1) as u32).max(1);
+            let usable_px_h = usable_rows as u32 * cell_h;
+            (fw, usable_px_h, cell_h, cell_w)
+        }
+    };
+
+    let (na, nb) = normalize_pair(img1, img2);
+    let (scaled_a, scaled_b) = scale_pair(&na, &nb, term_px_w, term_px_h);
+
+    let sixel_palette = if matches!(protocol, Protocol::Sixel) {
+        Some(SixelPalette::from_images(
+            &[&scaled_a, &scaled_b],
+            sixel_colors,
+        ))
+    } else {
+        None
+    };
+
+    InteractiveCache {
+        cols,
+        rows,
+        usable_rows,
+        term_px_w,
+        term_px_h,
+        cell_h,
+        cell_w,
+        scaled_a,
+        scaled_b,
+        sixel_palette,
+    }
+}
+
+/// Image height in terminal cell rows, given the composed image and cell pixel height.
+fn image_cell_rows(img_h: u32, protocol: &Protocol, cell_h: u32) -> u32 {
+    match protocol {
+        Protocol::Ansi => img_h.div_ceil(2),
+        _ => img_h.div_ceil(cell_h).max(1),
+    }
+}
+
+/// Image width in terminal cell columns, given the composed image and cell pixel width.
+fn image_cell_cols(img_w: u32, protocol: &Protocol, cell_w: u32) -> u32 {
+    match protocol {
+        Protocol::Ansi => img_w.max(1),
+        _ => img_w.div_ceil(cell_w).max(1),
+    }
+}
+
+#[derive(Default)]
+struct FrameStats {
+    frames: u32,
+    clear: std::time::Duration,
+    compose: std::time::Duration,
+    render: std::time::Duration,
+    status: std::time::Duration,
+    flush: std::time::Duration,
+    total: std::time::Duration,
+    last: Option<FrameSample>,
+}
+
+#[derive(Clone, Copy)]
+struct FrameSample {
+    clear: std::time::Duration,
+    compose: std::time::Duration,
+    render: std::time::Duration,
+    status: std::time::Duration,
+    flush: std::time::Duration,
+    total: std::time::Duration,
+    img_w: u32,
+    img_h: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_interactive_frame(
+    img1: &DynamicImage,
+    img2: &DynamicImage,
+    cached: &mut Option<InteractiveCache>,
+    mode: CompareMode,
+    slider: f32,
+    protocol: &Protocol,
+    sixel_colors: usize,
+    full_redraw: bool,
+    w: &mut impl Write,
+    stats: &mut FrameStats,
+) -> io::Result<()> {
+    use std::time::Instant;
+    let t_total = Instant::now();
+
+    if cached.is_none() {
+        *cached = Some(compute_interactive_cache(
+            img1,
+            img2,
+            protocol,
+            sixel_colors,
+        ));
+    }
+    let c = cached.as_ref().unwrap();
+
+    // Build the new frame fully into an in-memory buffer before touching the
+    // terminal, so the existing frame stays visible while we compose and
+    // encode. Once the buffer is ready, we clear and blit in one shot.
+    let mut frame: Vec<u8> = Vec::with_capacity(64 * 1024);
+
+    let t = Instant::now();
+    let composed = match mode {
+        CompareMode::TwoUp => compose_two_up(&c.scaled_a, &c.scaled_b, c.term_px_w, c.term_px_h),
+        CompareMode::Swipe => compose_swipe(&c.scaled_a, &c.scaled_b, slider),
+        CompareMode::OnionSkin => compose_onion(&c.scaled_a, &c.scaled_b, slider),
+        CompareMode::Left => c.scaled_a.clone(),
+        CompareMode::Right => c.scaled_b.clone(),
+    };
+    let dt_compose = t.elapsed();
+
+    // Center the image within the usable rows region (vertical) and full width.
+    let img_rows = image_cell_rows(composed.height(), protocol, c.cell_h);
+    let top_pad = (c.usable_rows as u32).saturating_sub(img_rows) / 2;
+    let img_cols = image_cell_cols(composed.width(), protocol, c.cell_w);
+    let left_pad = (c.cols as u32).saturating_sub(img_cols) / 2;
+    write!(frame, "\x1b[{};{}H", top_pad + 1, left_pad + 1)?;
+
+    let t = Instant::now();
+    match protocol {
+        Protocol::Kitty => write_kitty(&composed, &mut frame)?,
+        Protocol::Iterm2 => write_iterm2(&composed, &mut frame)?,
+        Protocol::Sixel => {
+            // The cache is guaranteed to hold a palette for the Sixel protocol.
+            let palette = c.sixel_palette.as_ref().expect("sixel palette cached");
+            write_sixel(&composed, palette, &mut frame)?
+        }
+        Protocol::Ansi => write_text(&composed, left_pad, &mut frame)?,
+    }
+    let dt_render = t.elapsed();
+
+    let t = Instant::now();
+    draw_status_bar(&mut frame, c.cols, c.rows, slider, mode)?;
+    let dt_status = t.elapsed();
+
+    // Clear the screen (or skip it for in-place updates) and emit the
+    // pre-rendered frame in a single flush. For Sixel/ANSI we can overwrite
+    // the previous image exactly as long as the layout is unchanged — no
+    // resize, no mode switch — which avoids the flicker of a full clear.
+    let t = Instant::now();
+    let skip_clear = !full_redraw && matches!(protocol, Protocol::Sixel | Protocol::Ansi);
+    if !skip_clear {
+        w.write_all(b"\x1b[2J\x1b[H")?;
+        // Kitty: also delete any prior image placements.
+        if matches!(protocol, Protocol::Kitty) {
+            w.write_all(b"\x1b_Ga=d;\x1b\\")?;
+        }
+    }
+    let dt_clear = t.elapsed();
+
+    let t = Instant::now();
+    w.write_all(&frame)?;
+    w.flush()?;
+    let dt_flush = t.elapsed();
+
+    let dt_total = t_total.elapsed();
+    stats.frames += 1;
+    stats.clear += dt_clear;
+    stats.compose += dt_compose;
+    stats.render += dt_render;
+    stats.status += dt_status;
+    stats.flush += dt_flush;
+    stats.total += dt_total;
+    stats.last = Some(FrameSample {
+        clear: dt_clear,
+        compose: dt_compose,
+        render: dt_render,
+        status: dt_status,
+        flush: dt_flush,
+        total: dt_total,
+        img_w: composed.width(),
+        img_h: composed.height(),
+    });
+    Ok(())
+}
+
+fn run_interactive(
+    img1: &DynamicImage,
+    img2: &DynamicImage,
+    protocol: &Protocol,
+    sixel_colors: usize,
+) -> io::Result<()> {
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use std::time::Duration;
+
+    let stdout = io::stdout();
+    // Larger-than-default buffer so sixel/kitty frames go out in fewer
+    // write() syscalls instead of many 8 KiB chunks.
+    let mut out = BufWriter::with_capacity(128 * 1024, stdout.lock());
+
+    crossterm::terminal::enable_raw_mode()?;
+    // Alt screen + hide cursor.
+    write!(out, "\x1b[?1049h\x1b[?25l")?;
+    out.flush()?;
+
+    let mut mode = CompareMode::Swipe;
+    // The last non-single comparison mode, so `m` can return to it
+    // after jumping into Left/Right via `s`.
+    let mut last_compare_mode = CompareMode::Swipe;
+    let mut slider: f32 = 0.5;
+    let mut cached: Option<InteractiveCache> = None;
+    // None until the first successful render, and reset on resize so the
+    // next frame forces a full clear.
+    let mut last_rendered_mode: Option<CompareMode> = None;
+    let mut dirty = true;
+    let mut stats = FrameStats::default();
+    let profile = env::var("IMGAP_PROFILE").is_ok();
+
+    let step = 0.02_f32;
+
+    let mut quit = false;
+    let result: io::Result<()> = (|| {
+        while !quit {
+            if dirty {
+                let full_redraw = cached.is_none() || last_rendered_mode != Some(mode);
+                render_interactive_frame(
+                    img1,
+                    img2,
+                    &mut cached,
+                    mode,
+                    slider,
+                    protocol,
+                    sixel_colors,
+                    full_redraw,
+                    &mut out,
+                    &mut stats,
+                )?;
+                last_rendered_mode = Some(mode);
+                dirty = false;
+            }
+
+            // Block for the next event…
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
+
+            // …then drain any other events already queued (e.g. key-repeat
+            // from holding ←/→) so we coalesce them into a single render.
+            loop {
+                match event::read()? {
+                    Event::Key(k) => match k.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            quit = true;
+                            break;
+                        }
+                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            quit = true;
+                            break;
+                        }
+                        KeyCode::Char('m') | KeyCode::Char('M') => {
+                            mode = if mode.is_single() {
+                                last_compare_mode
+                            } else {
+                                let next = mode.next();
+                                last_compare_mode = next;
+                                next
+                            };
+                            dirty = true;
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            mode = match mode {
+                                CompareMode::Left => CompareMode::Right,
+                                CompareMode::Right => CompareMode::Left,
+                                other => {
+                                    last_compare_mode = other;
+                                    CompareMode::Left
+                                }
+                            };
+                            dirty = true;
+                        }
+                        KeyCode::Left => {
+                            let s = if k.modifiers.contains(KeyModifiers::SHIFT) {
+                                step * 5.0
+                            } else {
+                                step
+                            };
+                            slider = (slider - s).max(0.0);
+                            dirty = true;
+                        }
+                        KeyCode::Right => {
+                            let s = if k.modifiers.contains(KeyModifiers::SHIFT) {
+                                step * 5.0
+                            } else {
+                                step
+                            };
+                            slider = (slider + s).min(1.0);
+                            dirty = true;
+                        }
+                        KeyCode::Home => {
+                            slider = 0.0;
+                            dirty = true;
+                        }
+                        KeyCode::End => {
+                            slider = 1.0;
+                            dirty = true;
+                        }
+                        _ => {}
+                    },
+                    Event::Resize(_, _) => {
+                        cached = None;
+                        last_rendered_mode = None;
+                        dirty = true;
+                    }
+                    _ => {}
+                }
+                // Stop draining as soon as the queue is empty.
+                if !event::poll(Duration::from_millis(0))? {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    // Restore terminal state.
+    let _ = write!(out, "\x1b[?25h\x1b[?1049l");
+    let _ = out.flush();
+    let _ = crossterm::terminal::disable_raw_mode();
+
+    if profile && stats.frames > 0 {
+        let n = stats.frames;
+        let avg = |d: std::time::Duration| d / n;
+        eprintln!(
+            "imgap profile: {} frames, protocol={}",
+            n,
+            match protocol {
+                Protocol::Kitty => "kitty",
+                Protocol::Iterm2 => "iterm2",
+                Protocol::Sixel => "sixel",
+                Protocol::Ansi => "ansi",
+            }
+        );
+        if let Some(s) = stats.last {
+            eprintln!(
+                "  last frame: {}x{}  total={:?}  clear={:?}  compose={:?}  render={:?}  status={:?}  flush={:?}",
+                s.img_w, s.img_h, s.total, s.clear, s.compose, s.render, s.status, s.flush
+            );
+        }
+        eprintln!(
+            "  avg/frame:  total={:?}  clear={:?}  compose={:?}  render={:?}  status={:?}  flush={:?}",
+            avg(stats.total),
+            avg(stats.clear),
+            avg(stats.compose),
+            avg(stats.render),
+            avg(stats.status),
+            avg(stats.flush),
+        );
+    }
+
+    result
 }
 
 /// Query terminal size and return available pixel dimensions (width, height),
@@ -128,7 +737,13 @@ fn query_terminal(query: &[u8], terminator: u8, timeout_ms: u64) -> Option<Vec<u
 
     let mut tty = open_tty()?;
 
-    crossterm::terminal::enable_raw_mode().ok()?;
+    // Preserve existing raw-mode state: if we're already in raw mode
+    // (e.g. inside the interactive TUI loop), don't disable it on the
+    // way out — that would unexpectedly re-enable line buffering.
+    let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !was_raw {
+        crossterm::terminal::enable_raw_mode().ok()?;
+    }
 
     tty.write_all(query).ok()?;
     tty.flush().ok()?;
@@ -153,7 +768,9 @@ fn query_terminal(query: &[u8], terminator: u8, timeout_ms: u64) -> Option<Vec<u
     });
 
     let response = rx.recv_timeout(Duration::from_millis(timeout_ms)).ok();
-    let _ = crossterm::terminal::disable_raw_mode();
+    if !was_raw {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
     response
 }
 
@@ -473,43 +1090,19 @@ fn write_iterm2(img: &RgbaImage, w: &mut impl Write) -> io::Result<()> {
     w.flush()
 }
 
-fn write_sixel(img: &RgbaImage, w: &mut impl Write) -> io::Result<()> {
+fn write_sixel(img: &RgbaImage, palette: &SixelPalette, w: &mut impl Write) -> io::Result<()> {
     let (width, height) = img.dimensions();
 
-    // Quantize to a 256-color palette using median cut on sampled pixels
-    let palette = build_palette(img, 255);
-
-    // Build pixel-to-palette-index map with a cache for repeated colors
-    let mut indexed = vec![0u8; (width * height) as usize];
-    let mut cache: HashMap<(u8, u8, u8), u8> = HashMap::new();
-    for y in 0..height {
-        for x in 0..width {
-            let p = img.get_pixel(x, y);
-            let key = (p[0], p[1], p[2]);
-            let idx = *cache
-                .entry(key)
-                .or_insert_with(|| nearest_color(&palette, p));
-            indexed[(y * width + x) as usize] = idx;
-        }
+    // Build pixel-to-palette-index map via the palette's LUT (O(1) per pixel).
+    let raw = img.as_raw();
+    let n_pixels = (width * height) as usize;
+    let mut indexed = vec![0u8; n_pixels];
+    for (dst, chunk) in indexed.iter_mut().zip(raw.chunks_exact(4)) {
+        *dst = palette.index(chunk[0], chunk[1], chunk[2]);
     }
 
-    // Pre-compute which colors appear in each band to avoid scanning all 255 colors
     let num_bands = height.div_ceil(6) as usize;
-    let mut band_colors: Vec<Vec<u8>> = Vec::with_capacity(num_bands);
-    for band in 0..num_bands {
-        let y_start = (band as u32) * 6;
-        let y_end = (y_start + 6).min(height);
-        let mut seen = [false; 256];
-        for y in y_start..y_end {
-            for x in 0..width {
-                seen[indexed[(y * width + x) as usize] as usize] = true;
-            }
-        }
-        let colors: Vec<u8> = (0..palette.len() as u8)
-            .filter(|&c| seen[c as usize])
-            .collect();
-        band_colors.push(colors);
-    }
+    let palette_len = palette.colors.len();
 
     // Build sixel data into a buffer
     let mut buf = Vec::with_capacity(width as usize * height as usize);
@@ -519,42 +1112,65 @@ fn write_sixel(img: &RgbaImage, w: &mut impl Write) -> io::Result<()> {
     write!(buf, "\x1bP0;1q\"1;1;{};{}", width, height)?;
 
     // Define colors
-    for (i, &(r, g, b)) in palette.iter().enumerate() {
+    for (i, &(r, g, b)) in palette.colors.iter().enumerate() {
         let rp = (r as u32 * 100) / 255;
         let gp = (g as u32 * 100) / 255;
         let bp = (b as u32 * 100) / 255;
         write!(buf, "#{};2;{};{};{}", i, rp, gp, bp)?;
     }
 
-    // Sixel data
-    for (band, colors) in band_colors.iter().enumerate() {
+    // Scratch buffers reused across bands. `row_bufs[c][x]` holds the 6-bit
+    // sixel value (not yet offset by 63) for color `c` at column `x` in the
+    // current band. `used` marks which colors appear in the current band.
+    let width_us = width as usize;
+    let mut row_bufs: Vec<Vec<u8>> = (0..palette_len).map(|_| vec![0u8; width_us]).collect();
+    let mut used: Vec<bool> = vec![false; palette_len];
+    let mut used_list: Vec<u16> = Vec::with_capacity(palette_len);
+
+    for band in 0..num_bands {
         let y_start = (band as u32) * 6;
-        for &color_idx in colors {
-            // Build sixel row for this color
+        let y_end = (y_start + 6).min(height);
+
+        // Reset only the colors that were dirty from the previous band.
+        for &c in &used_list {
+            used[c as usize] = false;
+            // Zero only this color's row buffer; avoids touching all palette_len * width bytes.
+            for v in &mut row_bufs[c as usize] {
+                *v = 0;
+            }
+        }
+        used_list.clear();
+
+        // Single pass over pixels in the band.
+        for y in y_start..y_end {
+            let bit = 1u8 << (y - y_start);
+            let row_base = (y as usize) * width_us;
+            let row = &indexed[row_base..row_base + width_us];
+            for x in 0..width_us {
+                let c = row[x] as usize;
+                if !used[c] {
+                    used[c] = true;
+                    used_list.push(c as u16);
+                }
+                row_bufs[c][x] |= bit;
+            }
+        }
+
+        for &c in &used_list {
+            let color_idx = c as usize;
             buf.push(b'#');
-            // Write color index as ASCII digits
             write!(buf, "{}", color_idx)?;
 
-            let mut row_data = Vec::with_capacity(width as usize);
-            for x in 0..width {
-                let mut sixel_val = 0u8;
-                for bit in 0..6u32 {
-                    let y = y_start + bit;
-                    if y < height && indexed[(y * width + x) as usize] == color_idx {
-                        sixel_val |= 1 << bit;
-                    }
-                }
-                row_data.push(sixel_val + 63);
-            }
-
-            // RLE compress
+            let row = &row_bufs[color_idx];
+            // RLE compress directly from the row buffer, adding 63 to form sixel chars.
             let mut i = 0;
-            while i < row_data.len() {
-                let ch = row_data[i];
+            while i < row.len() {
+                let sv = row[i];
                 let mut count = 1usize;
-                while i + count < row_data.len() && row_data[i + count] == ch {
+                while i + count < row.len() && row[i + count] == sv {
                     count += 1;
                 }
+                let ch = sv + 63;
                 if count >= 3 {
                     write!(buf, "!{}{}", count, ch as char)?;
                 } else {
@@ -580,10 +1196,15 @@ fn write_sixel(img: &RgbaImage, w: &mut impl Write) -> io::Result<()> {
 /// Render image as colored Unicode half-block characters (▄).
 /// Each terminal row encodes two pixel rows: background color for the top pixel,
 /// foreground color for the bottom pixel.
-fn write_text(img: &RgbaImage, w: &mut impl Write) -> io::Result<()> {
+fn write_text(img: &RgbaImage, left_pad: u32, w: &mut impl Write) -> io::Result<()> {
     let (width, height) = img.dimensions();
 
-    for y in (0..height).step_by(2) {
+    for (row, y) in (0..height).step_by(2).enumerate() {
+        // Row 0's cursor column is set by the caller; later rows start at
+        // column 1 after the row-ending \r\n, so shift them right to match.
+        if left_pad > 0 && row > 0 {
+            write!(w, "\x1b[{}C", left_pad)?;
+        }
         for x in 0..width {
             let top = img.get_pixel(x, y);
             let bottom = if y + 1 < height {
@@ -599,7 +1220,10 @@ fn write_text(img: &RgbaImage, w: &mut impl Write) -> io::Result<()> {
             // ESC[38;2;R;G;Bm = foreground (bottom pixel)
             write!(w, "\x1b[48;2;{tr};{tg};{tb}m\x1b[38;2;{br};{bg};{bb}m▄")?;
         }
-        writeln!(w, "\x1b[0m")?;
+        // Use an explicit CR+LF — in raw mode OPOST is off, so a bare \n
+        // would only move the cursor down and leave the column where the
+        // last glyph landed, skewing every other row.
+        write!(w, "\x1b[0m\r\n")?;
     }
     w.flush()
 }
@@ -614,69 +1238,134 @@ fn blend_alpha_rgb(pixel: &Rgba<u8>) -> (u8, u8, u8) {
     )
 }
 
-fn build_palette(img: &RgbaImage, max_colors: usize) -> Vec<(u8, u8, u8)> {
-    let (width, height) = img.dimensions();
-    let total = (width * height) as usize;
+/// 5 bits per channel → 32×32×32 = 32768-entry LUT (~32 KiB).
+/// Each LUT entry stores the index of the palette color closest to the
+/// bucket's midpoint. Accurate enough for a 255-color palette.
+const SIXEL_LUT_BITS: u32 = 5;
+const SIXEL_LUT_SHIFT: u32 = 8 - SIXEL_LUT_BITS;
+const SIXEL_LUT_LEN: usize = 1 << (SIXEL_LUT_BITS * 3);
 
-    // Sample at most 20K pixels for palette building
-    let max_samples = 20_000;
-    let step = if total > max_samples {
-        total / max_samples
-    } else {
-        1
-    };
+struct SixelPalette {
+    colors: Vec<(u8, u8, u8)>,
+    lut: Box<[u8]>,
+}
 
-    let raw = img.as_raw();
-    let mut pixels: Vec<(u8, u8, u8)> = Vec::with_capacity(total / step + 1);
-    let mut offset = 0;
-    while offset < total {
-        let base = offset * 4;
-        pixels.push((raw[base], raw[base + 1], raw[base + 2]));
-        offset += step;
+impl SixelPalette {
+    fn from_samples(samples: Vec<(u8, u8, u8)>, max_colors: usize) -> Self {
+        // Median cut.
+        let mut buckets: Vec<Vec<(u8, u8, u8)>> = vec![samples];
+        while buckets.len() < max_colors {
+            let mut best_idx = 0;
+            let mut best_range = 0u32;
+            for (i, bucket) in buckets.iter().enumerate() {
+                if bucket.len() < 2 {
+                    continue;
+                }
+                let range = channel_range(bucket);
+                if range > best_range {
+                    best_range = range;
+                    best_idx = i;
+                }
+            }
+            if best_range == 0 {
+                break;
+            }
+            let bucket = buckets.swap_remove(best_idx);
+            let (a, b) = split_bucket(bucket);
+            if !a.is_empty() {
+                buckets.push(a);
+            }
+            if !b.is_empty() {
+                buckets.push(b);
+            }
+        }
+
+        let colors: Vec<(u8, u8, u8)> = buckets
+            .iter()
+            .filter(|b| !b.is_empty())
+            .map(|bucket| {
+                let (mut sr, mut sg, mut sb) = (0u64, 0u64, 0u64);
+                for &(r, g, b) in bucket {
+                    sr += r as u64;
+                    sg += g as u64;
+                    sb += b as u64;
+                }
+                let n = bucket.len() as u64;
+                ((sr / n) as u8, (sg / n) as u8, (sb / n) as u8)
+            })
+            .collect();
+
+        // Build LUT: for each quantized RGB bucket midpoint, find nearest palette color.
+        let mut lut = vec![0u8; SIXEL_LUT_LEN].into_boxed_slice();
+        let bins = 1u32 << SIXEL_LUT_BITS;
+        let half = 1i32 << (SIXEL_LUT_SHIFT - 1);
+        for rb in 0..bins {
+            let rr = ((rb << SIXEL_LUT_SHIFT) as i32 + half).min(255);
+            for gb in 0..bins {
+                let gg = ((gb << SIXEL_LUT_SHIFT) as i32 + half).min(255);
+                for bb in 0..bins {
+                    let bbv = ((bb << SIXEL_LUT_SHIFT) as i32 + half).min(255);
+                    let mut best = 0u8;
+                    let mut best_d = i32::MAX;
+                    for (i, &(pr, pg, pb)) in colors.iter().enumerate() {
+                        let dr = rr - pr as i32;
+                        let dg = gg - pg as i32;
+                        let db = bbv - pb as i32;
+                        let d = dr * dr + dg * dg + db * db;
+                        if d < best_d {
+                            best_d = d;
+                            best = i as u8;
+                        }
+                    }
+                    let li = ((rb << (2 * SIXEL_LUT_BITS)) | (gb << SIXEL_LUT_BITS) | bb) as usize;
+                    lut[li] = best;
+                }
+            }
+        }
+
+        Self { colors, lut }
     }
 
-    let mut buckets: Vec<Vec<(u8, u8, u8)>> = vec![pixels];
-
-    while buckets.len() < max_colors {
-        let mut best_idx = 0;
-        let mut best_range = 0u32;
-        for (i, bucket) in buckets.iter().enumerate() {
-            if bucket.len() < 2 {
-                continue;
-            }
-            let range = channel_range(bucket);
-            if range > best_range {
-                best_range = range;
-                best_idx = i;
-            }
-        }
-        if best_range == 0 {
-            break;
-        }
-
-        let bucket = buckets.swap_remove(best_idx);
-        let (a, b) = split_bucket(bucket);
-        if !a.is_empty() {
-            buckets.push(a);
-        }
-        if !b.is_empty() {
-            buckets.push(b);
-        }
+    fn from_image(img: &RgbaImage, max_colors: usize) -> Self {
+        Self::from_samples(sample_pixels(&[img], 20_000), max_colors)
     }
 
-    buckets
-        .iter()
-        .map(|bucket| {
-            let (mut sr, mut sg, mut sb) = (0u64, 0u64, 0u64);
-            for &(r, g, b) in bucket {
-                sr += r as u64;
-                sg += g as u64;
-                sb += b as u64;
-            }
-            let n = bucket.len() as u64;
-            ((sr / n) as u8, (sg / n) as u8, (sb / n) as u8)
-        })
-        .collect()
+    fn from_images(imgs: &[&RgbaImage], max_colors: usize) -> Self {
+        Self::from_samples(sample_pixels(imgs, 10_000), max_colors)
+    }
+
+    #[inline]
+    fn index(&self, r: u8, g: u8, b: u8) -> u8 {
+        let ri = (r as usize) >> SIXEL_LUT_SHIFT;
+        let gi = (g as usize) >> SIXEL_LUT_SHIFT;
+        let bi = (b as usize) >> SIXEL_LUT_SHIFT;
+        let li = (ri << (2 * SIXEL_LUT_BITS)) | (gi << SIXEL_LUT_BITS) | bi;
+        self.lut[li]
+    }
+}
+
+/// Evenly sample at most `max_per_image` pixels from each input image.
+fn sample_pixels(imgs: &[&RgbaImage], max_per_image: usize) -> Vec<(u8, u8, u8)> {
+    let mut out = Vec::new();
+    for img in imgs {
+        let total = (img.width() * img.height()) as usize;
+        if total == 0 {
+            continue;
+        }
+        let step = if total > max_per_image {
+            total / max_per_image
+        } else {
+            1
+        };
+        let raw = img.as_raw();
+        let mut off = 0;
+        while off < total {
+            let base = off * 4;
+            out.push((raw[base], raw[base + 1], raw[base + 2]));
+            off += step;
+        }
+    }
+    out
 }
 
 fn channel_range(pixels: &[(u8, u8, u8)]) -> u32 {
@@ -726,21 +1415,4 @@ fn split_bucket(mut pixels: Vec<Rgb>) -> (Vec<Rgb>, Vec<Rgb>) {
     let mid = pixels.len() / 2;
     let b = pixels.split_off(mid);
     (pixels, b)
-}
-
-fn nearest_color(palette: &[(u8, u8, u8)], pixel: &Rgba<u8>) -> u8 {
-    let (r, g, b) = (pixel[0] as i32, pixel[1] as i32, pixel[2] as i32);
-    let mut best = 0u8;
-    let mut best_dist = i32::MAX;
-    for (i, &(pr, pg, pb)) in palette.iter().enumerate() {
-        let dr = r - pr as i32;
-        let dg = g - pg as i32;
-        let db = b - pb as i32;
-        let dist = dr * dr + dg * dg + db * db;
-        if dist < best_dist {
-            best_dist = dist;
-            best = i as u8;
-        }
-    }
-    best
 }
