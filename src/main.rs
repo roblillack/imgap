@@ -9,6 +9,10 @@ fn main() {
     // Extract optional flags from arguments
     let mut renderer_override: Option<String> = None;
     let mut interactive = false;
+    // Sixel palette depth in bits (1..=8): palette size = 1 << depth.
+    // Default 8 → 256 colors; lower values shrink the payload and speed up
+    // encoding/flush at the cost of some color fidelity.
+    let mut sixel_depth: u32 = 8;
     let mut filtered_args: Vec<&str> = Vec::new();
     let mut i = 1; // skip argv[0]
     while i < args.len() {
@@ -27,9 +31,26 @@ fn main() {
             i += 1;
             continue;
         }
+        // Accept `-d N` or `-d=N`.
+        if let Some(val) = args[i]
+            .strip_prefix("-d=")
+            .map(str::to_string)
+            .or_else(|| (args[i] == "-d" && i + 1 < args.len()).then(|| args[i + 1].clone()))
+        {
+            match val.parse::<u32>() {
+                Ok(d) if (1..=8).contains(&d) => sixel_depth = d,
+                _ => {
+                    eprintln!("Error: -d requires an integer in 1..=8");
+                    process::exit(1);
+                }
+            }
+            i += if args[i] == "-d" { 2 } else { 1 };
+            continue;
+        }
         filtered_args.push(&args[i]);
         i += 1;
     }
+    let sixel_colors: usize = 1usize << sixel_depth;
 
     // Resolve the two image paths. In priority order:
     //   1. `git diff --ext-diff` / `git difftool` (via `diff.*.command`) pass
@@ -46,9 +67,10 @@ fn main() {
     {
         (local, remote)
     } else {
-        eprintln!("Usage: imgap [-r <renderer>] [-i] <image1> <image2>");
+        eprintln!("Usage: imgap [-r <renderer>] [-i] [-d <1..8>] <image1> <image2>");
         eprintln!("Renderers: kitty, iterm2, sixel, ansi");
         eprintln!("  -i  interactive TUI mode (swipe / onion-skin / 2-up)");
+        eprintln!("  -d  sixel palette depth in bits (1..8, default 8 → 256 colors)");
         eprintln!("Also works as: git diff --ext-diff (via diff.*.command)");
         eprintln!("               git difftool (auto-enables interactive mode)");
         process::exit(1);
@@ -73,7 +95,7 @@ fn main() {
     let protocol = detect_protocol(renderer_override.as_deref());
 
     if interactive {
-        run_interactive(&img1, &img2, &protocol).unwrap_or_else(|e| {
+        run_interactive(&img1, &img2, &protocol, sixel_colors).unwrap_or_else(|e| {
             eprintln!("Interactive mode failed: {}", e);
             process::exit(1);
         });
@@ -95,7 +117,7 @@ fn main() {
         Protocol::Kitty => write_kitty(&comparison, &mut w),
         Protocol::Iterm2 => write_iterm2(&comparison, &mut w),
         Protocol::Sixel => {
-            let palette = SixelPalette::from_image(&comparison, 255);
+            let palette = SixelPalette::from_image(&comparison, sixel_colors);
             write_sixel(&comparison, &palette, &mut w)
         }
         Protocol::Ansi => write_text(&comparison, 0, &mut w),
@@ -296,6 +318,7 @@ fn compute_interactive_cache(
     img1: &DynamicImage,
     img2: &DynamicImage,
     protocol: &Protocol,
+    sixel_colors: usize,
 ) -> InteractiveCache {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let usable_rows = rows.saturating_sub(INTERACTIVE_RESERVE_ROWS).max(1);
@@ -315,7 +338,10 @@ fn compute_interactive_cache(
     let (scaled_a, scaled_b) = scale_pair(&na, &nb, term_px_w, term_px_h);
 
     let sixel_palette = if matches!(protocol, Protocol::Sixel) {
-        Some(SixelPalette::from_images(&[&scaled_a, &scaled_b], 64))
+        Some(SixelPalette::from_images(
+            &[&scaled_a, &scaled_b],
+            sixel_colors,
+        ))
     } else {
         None
     };
@@ -382,6 +408,7 @@ fn render_interactive_frame(
     mode: CompareMode,
     slider: f32,
     protocol: &Protocol,
+    sixel_colors: usize,
     w: &mut impl Write,
     stats: &mut FrameStats,
 ) -> io::Result<()> {
@@ -389,7 +416,12 @@ fn render_interactive_frame(
     let t_total = Instant::now();
 
     if cached.is_none() {
-        *cached = Some(compute_interactive_cache(img1, img2, protocol));
+        *cached = Some(compute_interactive_cache(
+            img1,
+            img2,
+            protocol,
+            sixel_colors,
+        ));
     }
     let c = cached.as_ref().unwrap();
 
@@ -471,6 +503,7 @@ fn run_interactive(
     img1: &DynamicImage,
     img2: &DynamicImage,
     protocol: &Protocol,
+    sixel_colors: usize,
 ) -> io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use std::time::Duration;
@@ -508,6 +541,7 @@ fn run_interactive(
                     mode,
                     slider,
                     protocol,
+                    sixel_colors,
                     &mut out,
                     &mut stats,
                 )?;
