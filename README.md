@@ -34,13 +34,26 @@ imgap -i <image1> <image2>
 
 ## Using with git difftool
 
+### If you also use imgap as a `git diff` driver
+
 Once `diff.image.command` is configured (see [Using with git diff](#using-with-git-diff) below), `git difftool` works out of the box. imgap automatically enters interactive mode when git invokes it through difftool (it checks for `GIT_DIFFTOOL_TRUST_EXIT_CODE` in the environment), so plain `git diff` stays inline and static while `git difftool` pops the interactive TUI:
 
 ```sh
 git difftool -- '**/*.png'
 ```
 
-difftool opens each modified image in the interactive TUI one after another — press `q` to advance to the next file.
+### Standalone difftool
+
+If you don't want the `git diff` integration, register imgap as a named difftool instead:
+
+```sh
+git config --global difftool.imgap.cmd 'imgap -i "$LOCAL" "$REMOTE"'
+git config --global difftool.prompt false
+
+git difftool -t imgap -- '**/*.png'
+```
+
+Either way, difftool opens each modified image in the interactive TUI one after another — press `q` to advance to the next file.
 
 ## Install
 
