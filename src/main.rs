@@ -32,23 +32,19 @@ fn main() {
     }
 
     // Resolve the two image paths. In priority order:
-    //   1. `git diff --ext-diff` passes 7 args:
-    //        path old-file old-hex old-mode new-file new-hex new-mode
+    //   1. `git diff --ext-diff` / `git difftool` (via `diff.*.command`) pass
+    //      7 args: path old-file old-hex old-mode new-file new-hex new-mode
     //   2. Two positional arguments: <image1> <image2>
-    //   3. No positional args + LOCAL/REMOTE env vars set by `git difftool`.
-    //
-    // GIT_DIFF_PATH_TOTAL is set by `git diff` with an external driver but
-    // not by `git difftool`, so its absence distinguishes the two cases.
-    let via_difftool_env = env::var("GIT_DIFF_PATH_TOTAL").is_err()
-        && env::var("LOCAL").is_ok()
-        && env::var("REMOTE").is_ok();
-
+    //   3. No positional args + LOCAL/REMOTE env vars, which `git difftool`
+    //      exports when the tool is registered via `difftool.*.cmd`.
     let (path1, path2): (String, String) = if filtered_args.len() == 7 {
         (filtered_args[1].to_string(), filtered_args[4].to_string())
     } else if filtered_args.len() == 2 {
         (filtered_args[0].to_string(), filtered_args[1].to_string())
-    } else if filtered_args.is_empty() && via_difftool_env {
-        (env::var("LOCAL").unwrap(), env::var("REMOTE").unwrap())
+    } else if filtered_args.is_empty()
+        && let (Ok(local), Ok(remote)) = (env::var("LOCAL"), env::var("REMOTE"))
+    {
+        (local, remote)
     } else {
         eprintln!("Usage: imgap [-r <renderer>] [-i] <image1> <image2>");
         eprintln!("Renderers: kitty, iterm2, sixel, ansi");
@@ -59,7 +55,9 @@ fn main() {
     };
 
     // Auto-enable interactive mode when invoked via `git difftool`.
-    if !interactive && via_difftool_env {
+    // `git-difftool--helper` sets GIT_DIFFTOOL_TRUST_EXIT_CODE in the env of
+    // the external diff command; plain `git diff` does not set it.
+    if !interactive && env::var("GIT_DIFFTOOL_TRUST_EXIT_CODE").is_ok() {
         interactive = true;
     }
 
