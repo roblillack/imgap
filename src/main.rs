@@ -48,10 +48,7 @@ fn main() {
     } else if filtered_args.len() == 2 {
         (filtered_args[0].to_string(), filtered_args[1].to_string())
     } else if filtered_args.is_empty() && via_difftool_env {
-        (
-            env::var("LOCAL").unwrap(),
-            env::var("REMOTE").unwrap(),
-        )
+        (env::var("LOCAL").unwrap(), env::var("REMOTE").unwrap())
     } else {
         eprintln!("Usage: imgap [-r <renderer>] [-i] <image1> <image2>");
         eprintln!("Renderers: kitty, iterm2, sixel, ansi");
@@ -585,7 +582,7 @@ fn run_interactive(
     let _ = crossterm::terminal::disable_raw_mode();
 
     if profile && stats.frames > 0 {
-        let n = stats.frames as u32;
+        let n = stats.frames;
         let avg = |d: std::time::Duration| d / n;
         eprintln!(
             "imgap profile: {} frames, protocol={}",
@@ -1032,9 +1029,8 @@ fn write_sixel(img: &RgbaImage, palette: &SixelPalette, w: &mut impl Write) -> i
     let raw = img.as_raw();
     let n_pixels = (width * height) as usize;
     let mut indexed = vec![0u8; n_pixels];
-    for i in 0..n_pixels {
-        let base = i * 4;
-        indexed[i] = palette.index(raw[base], raw[base + 1], raw[base + 2]);
+    for (dst, chunk) in indexed.iter_mut().zip(raw.chunks_exact(4)) {
+        *dst = palette.index(chunk[0], chunk[1], chunk[2]);
     }
 
     let num_bands = height.div_ceil(6) as usize;
