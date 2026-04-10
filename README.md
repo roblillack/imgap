@@ -18,6 +18,33 @@ imgap <image1> <image2>
 
 Supports PNG, JPG, WebP, GIF, BMP, TIFF, and other common formats.
 
+### Interactive mode
+
+Pass `-i` for a full-screen TUI that overlays the two images with a keyboard-driven slider:
+
+```
+imgap -i <image1> <image2>
+```
+
+- `←` / `→` — move the slider (hold `Shift` for bigger steps)
+- `m` — cycle comparison modes: **2-up**, **swipe**, **onion skin**
+- `s` — swap to the left-only view; press again for right-only; `m` returns to the last comparison mode
+- `Home` / `End` — jump to 0% / 100%
+- `q` / `Esc` — quit
+
+## Using with git difftool
+
+Interactive mode auto-enables when invoked via `git difftool`:
+
+```sh
+git config --global diff.tool imgap
+git config --global difftool.imgap.cmd imgap
+git config --global difftool.prompt false
+git difftool HEAD~1 -- some.png
+```
+
+imgap reads `LOCAL` and `REMOTE` from the environment that `git difftool` exports, so the `.cmd` doesn't need to pass them explicitly.
+
 ## Install
 
 ```
@@ -34,7 +61,7 @@ imgap auto-detects your terminal's image protocol:
 
 ## Using with git diff
 
-imgap natively understands git's external diff calling convention -- no wrapper script needed.
+imgap also natively understands git's external diff calling convention (for the inline, non-interactive view) -- no wrapper script needed.
 
 ### 1. Configure git
 
