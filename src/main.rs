@@ -388,19 +388,15 @@ fn render_interactive_frame(
     use std::time::Instant;
     let t_total = Instant::now();
 
-    // Clear screen and home cursor.
-    let t = Instant::now();
-    write!(w, "\x1b[2J\x1b[H")?;
-    // Kitty: also delete any prior image placements.
-    if matches!(protocol, Protocol::Kitty) {
-        write!(w, "\x1b_Ga=d;\x1b\\")?;
-    }
-    let dt_clear = t.elapsed();
-
     if cached.is_none() {
         *cached = Some(compute_interactive_cache(img1, img2, protocol));
     }
     let c = cached.as_ref().unwrap();
+
+    // Build the new frame fully into an in-memory buffer before touching the
+    // terminal, so the existing frame stays visible while we compose and
+    // encode. Once the buffer is ready, we clear and blit in one shot.
+    let mut frame: Vec<u8> = Vec::with_capacity(64 * 1024);
 
     let t = Instant::now();
     let composed = match mode {
@@ -417,26 +413,36 @@ fn render_interactive_frame(
     let top_pad = (c.usable_rows as u32).saturating_sub(img_rows) / 2;
     let img_cols = image_cell_cols(composed.width(), protocol, c.cell_w);
     let left_pad = (c.cols as u32).saturating_sub(img_cols) / 2;
-    write!(w, "\x1b[{};{}H", top_pad + 1, left_pad + 1)?;
+    write!(frame, "\x1b[{};{}H", top_pad + 1, left_pad + 1)?;
 
     let t = Instant::now();
     match protocol {
-        Protocol::Kitty => write_kitty(&composed, w)?,
-        Protocol::Iterm2 => write_iterm2(&composed, w)?,
+        Protocol::Kitty => write_kitty(&composed, &mut frame)?,
+        Protocol::Iterm2 => write_iterm2(&composed, &mut frame)?,
         Protocol::Sixel => {
             // The cache is guaranteed to hold a palette for the Sixel protocol.
             let palette = c.sixel_palette.as_ref().expect("sixel palette cached");
-            write_sixel(&composed, palette, w)?
+            write_sixel(&composed, palette, &mut frame)?
         }
-        Protocol::Ansi => write_text(&composed, left_pad, w)?,
+        Protocol::Ansi => write_text(&composed, left_pad, &mut frame)?,
     }
     let dt_render = t.elapsed();
 
     let t = Instant::now();
-    draw_status_bar(w, c.cols, c.rows, slider, mode)?;
+    draw_status_bar(&mut frame, c.cols, c.rows, slider, mode)?;
     let dt_status = t.elapsed();
 
+    // Clear the screen and emit the pre-rendered frame in a single flush.
     let t = Instant::now();
+    w.write_all(b"\x1b[2J\x1b[H")?;
+    // Kitty: also delete any prior image placements.
+    if matches!(protocol, Protocol::Kitty) {
+        w.write_all(b"\x1b_Ga=d;\x1b\\")?;
+    }
+    let dt_clear = t.elapsed();
+
+    let t = Instant::now();
+    w.write_all(&frame)?;
     w.flush()?;
     let dt_flush = t.elapsed();
 
