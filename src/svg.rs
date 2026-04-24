@@ -26,9 +26,32 @@ pub fn is_svg(path: &Path) -> bool {
 pub fn rasterize(path: &Path, max_w: u32, max_h: u32) -> io::Result<DynamicImage> {
     let data = std::fs::read(path)?;
 
-    let mut opt = usvg::Options::default();
-    opt.fontdb_mut().load_font_data(DEFAULT_FONT.to_vec());
-    opt.font_family = DEFAULT_FONT_FAMILY.to_string();
+    let mut opt = usvg::Options {
+        font_family: DEFAULT_FONT_FAMILY.to_string(),
+        ..usvg::Options::default()
+    };
+    let db = opt.fontdb_mut();
+    db.load_font_data(DEFAULT_FONT.to_vec());
+    // Route every generic family to the bundled face so SVGs that opt into
+    // `sans-serif`, `serif`, etc. resolve cleanly.
+    db.set_serif_family(DEFAULT_FONT_FAMILY);
+    db.set_sans_serif_family(DEFAULT_FONT_FAMILY);
+    db.set_cursive_family(DEFAULT_FONT_FAMILY);
+    db.set_fantasy_family(DEFAULT_FONT_FAMILY);
+    db.set_monospace_family(DEFAULT_FONT_FAMILY);
+
+    // SVGs commonly request concrete families (`Arial`, `Helvetica`, `Segoe
+    // UI`, …) without a generic fallback. usvg's default resolver then hands
+    // back `None` for those and text disappears silently. Override the
+    // resolver so any request maps to our single bundled face.
+    let font_id = db.faces().next().map(|f| f.id);
+    if let Some(id) = font_id {
+        let default_resolver = usvg::FontResolver::default();
+        opt.font_resolver = usvg::FontResolver {
+            select_font: Box::new(move |_, _| Some(id)),
+            select_fallback: default_resolver.select_fallback,
+        };
+    }
 
     let tree = usvg::Tree::from_data(&data, &opt)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid SVG: {}", e)))?;
