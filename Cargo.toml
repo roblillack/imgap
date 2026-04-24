@@ -10,10 +10,15 @@ homepage = "https://github.com/roblillack/imgap"
 repository = "https://github.com/roblillack/imgap"
 documentation = "https://docs.rs/imgap"
 
+[features]
+default = ["svg"]
+svg = ["dep:resvg"]
+
 [dependencies]
 image = "0.25"
 base64 = "0.22"
 crossterm = "0.28"
+resvg = { version = "0.47", default-features = false, features = ["text", "raster-images"], optional = true }
 
 [profile.dev]
 opt-level = 2

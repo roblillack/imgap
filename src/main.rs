@@ -3,6 +3,9 @@ use std::env;
 use std::io::{self, BufWriter, Write};
 use std::process;
 
+#[cfg(feature = "svg")]
+mod svg;
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -83,16 +86,24 @@ fn main() {
         interactive = true;
     }
 
-    let img1 = image::open(&path1).unwrap_or_else(|e| {
+    let protocol = detect_protocol(renderer_override.as_deref());
+
+    // For text mode each terminal cell is 1 char wide and 2 pixels tall (half-blocks),
+    // so compute dimensions differently than for graphics protocols. We determine
+    // this up front so SVG inputs can be rasterized directly at the output size.
+    let (term_px_w, term_px_h) = match protocol {
+        Protocol::Ansi => terminal_char_size(5),
+        _ => terminal_pixel_size(5),
+    };
+
+    let img1 = load_image(&path1, term_px_w, term_px_h).unwrap_or_else(|e| {
         eprintln!("Failed to open '{}': {}", path1, e);
         process::exit(1);
     });
-    let img2 = image::open(&path2).unwrap_or_else(|e| {
+    let img2 = load_image(&path2, term_px_w, term_px_h).unwrap_or_else(|e| {
         eprintln!("Failed to open '{}': {}", path2, e);
         process::exit(1);
     });
-
-    let protocol = detect_protocol(renderer_override.as_deref());
 
     if interactive {
         run_interactive(&img1, &img2, &protocol, sixel_colors).unwrap_or_else(|e| {
@@ -101,13 +112,6 @@ fn main() {
         });
         return;
     }
-
-    // For text mode each terminal cell is 1 char wide and 2 pixels tall (half-blocks),
-    // so compute dimensions differently than for graphics protocols.
-    let (term_px_w, term_px_h) = match protocol {
-        Protocol::Ansi => terminal_char_size(5),
-        _ => terminal_pixel_size(5),
-    };
 
     let comparison = build_comparison(&img1, &img2, term_px_w, term_px_h);
 
@@ -1044,6 +1048,22 @@ fn detect_protocol(renderer_override: Option<&str>) -> Protocol {
     }
 
     Protocol::Ansi
+}
+
+/// Read an image from disk. With the `svg` feature, paths ending in `.svg`
+/// or `.svgz` are rasterized via resvg to fit within `max_w` x `max_h` so
+/// downstream compare/render logic can treat them like any other bitmap.
+fn load_image(path: &str, max_w: u32, max_h: u32) -> Result<DynamicImage, String> {
+    #[cfg(feature = "svg")]
+    {
+        let p = std::path::Path::new(path);
+        if svg::is_svg(p) {
+            return svg::rasterize(p, max_w, max_h).map_err(|e| e.to_string());
+        }
+    }
+    #[cfg(not(feature = "svg"))]
+    let _ = (max_w, max_h);
+    image::open(path).map_err(|e| e.to_string())
 }
 
 fn encode_png(img: &RgbaImage) -> Vec<u8> {
