@@ -142,6 +142,7 @@ enum CompareMode {
     TwoUp,
     Swipe,
     OnionSkin,
+    Difference,
     Left,
     Right,
 }
@@ -153,7 +154,8 @@ impl CompareMode {
         match self {
             Self::TwoUp => Self::Swipe,
             Self::Swipe => Self::OnionSkin,
-            Self::OnionSkin => Self::TwoUp,
+            Self::OnionSkin => Self::Difference,
+            Self::Difference => Self::TwoUp,
             Self::Left | Self::Right => Self::TwoUp,
         }
     }
@@ -162,6 +164,7 @@ impl CompareMode {
             Self::TwoUp => "2-up",
             Self::Swipe => "swipe",
             Self::OnionSkin => "onion skin",
+            Self::Difference => "difference",
             Self::Left => "left only",
             Self::Right => "right only",
         }
@@ -272,26 +275,26 @@ fn draw_status_bar(
     let slider_row = rows.saturating_sub(2).max(1);
     let help_row = rows.saturating_sub(1).max(1);
 
-    // Slider line
+    // Slider line — only drawn for modes that respond to it. The row is
+    // always cleared so the previous mode's slider doesn't linger.
     write!(w, "\x1b[{};1H\x1b[2K", slider_row + 1)?;
-    let pct = (slider * 100.0).round() as u32;
-    let label = format!(" {:3}%", pct);
-    let bar_width = (cols as usize).saturating_sub(label.len() + 2).max(10);
-    let pos = ((bar_width as f32) * slider) as usize;
-    let active = mode.uses_slider();
-    write!(w, "[")?;
-    for i in 0..bar_width {
-        if active && i == pos.min(bar_width - 1) {
-            write!(w, "\x1b[33m█\x1b[0m")?;
-        } else if active && i < pos {
-            write!(w, "=")?;
-        } else if active {
-            write!(w, "-")?;
-        } else {
-            write!(w, "·")?;
+    if mode.uses_slider() {
+        let pct = (slider * 100.0).round() as u32;
+        let label = format!(" {:3}%", pct);
+        let bar_width = (cols as usize).saturating_sub(label.len() + 2).max(10);
+        let pos = ((bar_width as f32) * slider) as usize;
+        write!(w, "[")?;
+        for i in 0..bar_width {
+            if i == pos.min(bar_width - 1) {
+                write!(w, "\x1b[33m█\x1b[0m")?;
+            } else if i < pos {
+                write!(w, "=")?;
+            } else {
+                write!(w, "-")?;
+            }
         }
+        write!(w, "]{}", label)?;
     }
-    write!(w, "]{}", label)?;
 
     // Help line
     write!(w, "\x1b[{};1H\x1b[2K", help_row + 1)?;
@@ -315,6 +318,9 @@ struct InteractiveCache {
     cell_w: u32,
     scaled_a: RgbaImage,
     scaled_b: RgbaImage,
+    /// Pre-rendered heatmap of pixel differences, sized to match `scaled_a`/
+    /// `scaled_b` so the difference mode can blit it directly.
+    scaled_diff: RgbaImage,
     /// Built once per resize for the Sixel protocol. Approximates onion-skin
     /// blend colors via nearest-color lookup.
     sixel_palette: Option<SixelPalette>,
@@ -350,9 +356,15 @@ fn compute_interactive_cache(
     let (na, nb) = normalize_pair(img1, img2);
     let (scaled_a, scaled_b) = scale_pair(&na, &nb, term_px_w, term_px_h);
 
+    // Build the diff heatmap on the original images (so out-of-overlap regions
+    // stay magenta), then scale by the same factor so it lines up with
+    // `scaled_a`/`scaled_b` pixel-for-pixel.
+    let diff_full = build_diff_heatmap(img1, img2);
+    let scaled_diff = scale_rgba(&diff_full, term_px_w, term_px_h);
+
     let sixel_palette = if matches!(protocol, Protocol::Sixel) {
         Some(SixelPalette::from_images(
-            &[&scaled_a, &scaled_b],
+            &[&scaled_a, &scaled_b, &scaled_diff],
             sixel_colors,
         ))
     } else {
@@ -369,6 +381,7 @@ fn compute_interactive_cache(
         cell_w,
         scaled_a,
         scaled_b,
+        scaled_diff,
         sixel_palette,
     }
 }
@@ -450,6 +463,7 @@ fn render_interactive_frame(
         CompareMode::TwoUp => compose_two_up(&c.scaled_a, &c.scaled_b, c.term_px_w, c.term_px_h),
         CompareMode::Swipe => compose_swipe(&c.scaled_a, &c.scaled_b, slider),
         CompareMode::OnionSkin => compose_onion(&c.scaled_a, &c.scaled_b, slider),
+        CompareMode::Difference => c.scaled_diff.clone(),
         CompareMode::Left => c.scaled_a.clone(),
         CompareMode::Right => c.scaled_b.clone(),
     };
