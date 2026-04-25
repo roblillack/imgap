@@ -29,10 +29,12 @@ imgap -i <image1> <image2>
 ![imgap demo showing interactive mode](demo.gif)
 
 - `←` / `→` — move the slider (hold `Shift` for bigger steps)
-- `m` — cycle comparison modes: **2-up**, **swipe**, **onion skin**
+- `m` — cycle comparison modes: **2-up**, **swipe**, **onion skin**, **difference**
 - `s` — swap to the left-only view; press again for right-only; `m` returns to the last comparison mode
 - `Home` / `End` — jump to 0% / 100%
 - `q` / `Esc` — quit
+
+The **difference** mode renders the same heatmap shown in non-interactive output: black (identical) through blue, green, yellow to red (maximum difference), with magenta marking regions where the two images differ in size.
 
 ## Install
 
