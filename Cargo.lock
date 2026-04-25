@@ -471,7 +471,7 @@ checksum = "09e54e57b4c48b40f7aec75635392b12b3421fa26fe8b4332e63138ed278459c"
 
 [[package]]
 name = "imgap"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "crossterm",
