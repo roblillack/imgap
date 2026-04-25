@@ -15,7 +15,7 @@ default = ["svg"]
 svg = ["dep:resvg"]
 
 [dependencies]
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["rayon", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 base64 = "0.22"
 crossterm = "0.28"
 resvg = { version = "0.47", default-features = false, features = ["text", "raster-images"], optional = true }
