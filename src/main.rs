@@ -105,8 +105,12 @@ fn main() {
         process::exit(1);
     });
 
+    let meta1 = read_meta(&path1, &img1);
+    let meta2 = read_meta(&path2, &img2);
+    let meta = format_meta_line(&meta1, &meta2);
+
     if interactive {
-        run_interactive(&img1, &img2, &protocol, sixel_colors).unwrap_or_else(|e| {
+        run_interactive(&img1, &img2, &protocol, sixel_colors, &meta).unwrap_or_else(|e| {
             eprintln!("Interactive mode failed: {}", e);
             process::exit(1);
         });
@@ -117,19 +121,20 @@ fn main() {
 
     let stdout = io::stdout().lock();
     let mut w = BufWriter::new(stdout);
-    match protocol {
-        Protocol::Kitty => write_kitty(&comparison, &mut w),
-        Protocol::Iterm2 => write_iterm2(&comparison, &mut w),
-        Protocol::Sixel => {
-            let palette = SixelPalette::from_image(&comparison, sixel_colors);
-            write_sixel(&comparison, &palette, &mut w)
-        }
-        Protocol::Ansi => write_text(&comparison, 0, &mut w),
-    }
-    .unwrap_or_else(|e| {
-        eprintln!("Failed to write image: {}", e);
-        process::exit(1);
-    });
+    writeln!(w, "{}", meta)
+        .and_then(|_| match protocol {
+            Protocol::Kitty => write_kitty(&comparison, &mut w),
+            Protocol::Iterm2 => write_iterm2(&comparison, &mut w),
+            Protocol::Sixel => {
+                let palette = SixelPalette::from_image(&comparison, sixel_colors);
+                write_sixel(&comparison, &palette, &mut w)
+            }
+            Protocol::Ansi => write_text(&comparison, 0, &mut w),
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to write image: {}", e);
+            process::exit(1);
+        });
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -315,8 +320,10 @@ struct InteractiveCache {
     sixel_palette: Option<SixelPalette>,
 }
 
+/// Reserve 1 top row for the metadata line.
+const INTERACTIVE_TOP_ROWS: u16 = 1;
 /// Reserve 3 bottom rows for spacer + slider + help.
-const INTERACTIVE_RESERVE_ROWS: u16 = 3;
+const INTERACTIVE_BOTTOM_ROWS: u16 = 3;
 
 fn compute_interactive_cache(
     img1: &DynamicImage,
@@ -325,7 +332,9 @@ fn compute_interactive_cache(
     sixel_colors: usize,
 ) -> InteractiveCache {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let usable_rows = rows.saturating_sub(INTERACTIVE_RESERVE_ROWS).max(1);
+    let usable_rows = rows
+        .saturating_sub(INTERACTIVE_TOP_ROWS + INTERACTIVE_BOTTOM_ROWS)
+        .max(1);
 
     let (term_px_w, term_px_h, cell_h, cell_w) = match protocol {
         Protocol::Ansi => (cols as u32, usable_rows as u32 * 2, 2u32, 1u32),
@@ -413,6 +422,7 @@ fn render_interactive_frame(
     slider: f32,
     protocol: &Protocol,
     sixel_colors: usize,
+    meta: &str,
     full_redraw: bool,
     w: &mut impl Write,
     stats: &mut FrameStats,
@@ -450,7 +460,8 @@ fn render_interactive_frame(
     let top_pad = (c.usable_rows as u32).saturating_sub(img_rows) / 2;
     let img_cols = image_cell_cols(composed.width(), protocol, c.cell_w);
     let left_pad = (c.cols as u32).saturating_sub(img_cols) / 2;
-    write!(frame, "\x1b[{};{}H", top_pad + 1, left_pad + 1)?;
+    let img_top_row = top_pad + 1 + INTERACTIVE_TOP_ROWS as u32;
+    write!(frame, "\x1b[{};{}H", img_top_row, left_pad + 1)?;
 
     let t = Instant::now();
     match protocol {
@@ -466,6 +477,7 @@ fn render_interactive_frame(
     let dt_render = t.elapsed();
 
     let t = Instant::now();
+    draw_meta_line(&mut frame, c.cols, meta)?;
     draw_status_bar(&mut frame, c.cols, c.rows, slider, mode)?;
     let dt_status = t.elapsed();
 
@@ -515,6 +527,7 @@ fn run_interactive(
     img2: &DynamicImage,
     protocol: &Protocol,
     sixel_colors: usize,
+    meta: &str,
 ) -> io::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use std::time::Duration;
@@ -557,6 +570,7 @@ fn run_interactive(
                     slider,
                     protocol,
                     sixel_colors,
+                    meta,
                     full_redraw,
                     &mut out,
                     &mut stats,
@@ -1053,6 +1067,103 @@ fn detect_protocol(renderer_override: Option<&str>) -> Protocol {
 /// Read an image from disk. With the `svg` feature, paths ending in `.svg`
 /// or `.svgz` are rasterized via resvg to fit within `max_w` x `max_h` so
 /// downstream compare/render logic can treat them like any other bitmap.
+struct ImageMeta {
+    /// Display name like "PNG", "JPEG", "SVG", or "?" when undetectable.
+    format: &'static str,
+    width: u32,
+    height: u32,
+    size: u64,
+}
+
+fn read_meta(path: &str, img: &DynamicImage) -> ImageMeta {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let detected = image::ImageReader::open(path)
+        .ok()
+        .and_then(|r| r.with_guessed_format().ok())
+        .and_then(|r| r.format());
+    let format = format_name(detected).unwrap_or_else(|| {
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".svg") || lower.ends_with(".svgz") {
+            "SVG"
+        } else {
+            "?"
+        }
+    });
+    ImageMeta {
+        format,
+        width: img.width(),
+        height: img.height(),
+        size,
+    }
+}
+
+fn format_name(fmt: Option<image::ImageFormat>) -> Option<&'static str> {
+    Some(match fmt? {
+        image::ImageFormat::Png => "PNG",
+        image::ImageFormat::Jpeg => "JPEG",
+        image::ImageFormat::Gif => "GIF",
+        image::ImageFormat::WebP => "WebP",
+        image::ImageFormat::Bmp => "BMP",
+        image::ImageFormat::Tiff => "TIFF",
+        image::ImageFormat::Ico => "ICO",
+        image::ImageFormat::Hdr => "HDR",
+        image::ImageFormat::OpenExr => "EXR",
+        image::ImageFormat::Pnm => "PNM",
+        image::ImageFormat::Dds => "DDS",
+        image::ImageFormat::Tga => "TGA",
+        image::ImageFormat::Farbfeld => "Farbfeld",
+        image::ImageFormat::Avif => "AVIF",
+        image::ImageFormat::Qoi => "QOI",
+        _ => return None,
+    })
+}
+
+fn format_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1}GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1}MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1}KiB", b / KIB)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+/// Build a single-line summary like `PNG 1024x768→800x600 24.5KiB→18.3KiB`.
+/// Each property is collapsed to a single value when both sides match
+/// (e.g. same dimensions render as `1024x768` instead of `1024x768→1024x768`).
+fn format_meta_line(a: &ImageMeta, b: &ImageMeta) -> String {
+    let fmt = pair(a.format, b.format, |s| s.to_string());
+    let dims = pair((a.width, a.height), (b.width, b.height), |(w, h)| {
+        format!("{}x{}", w, h)
+    });
+    let size = pair(a.size, b.size, format_size);
+    format!("{} {} {}", fmt, dims, size)
+}
+
+fn pair<T: PartialEq>(a: T, b: T, fmt: impl Fn(T) -> String) -> String {
+    if a == b {
+        fmt(a)
+    } else {
+        format!("{}→{}", fmt(a), fmt(b))
+    }
+}
+
+fn draw_meta_line(w: &mut impl Write, cols: u16, meta: &str) -> io::Result<()> {
+    write!(w, "\x1b[1;1H\x1b[2K")?;
+    let width = meta.chars().count();
+    let pad = (cols as usize).saturating_sub(width) / 2;
+    if pad > 0 {
+        write!(w, "\x1b[{}C", pad)?;
+    }
+    write!(w, "\x1b[2m{}\x1b[0m", meta)
+}
+
 fn load_image(path: &str, max_w: u32, max_h: u32) -> Result<DynamicImage, String> {
     #[cfg(feature = "svg")]
     {
