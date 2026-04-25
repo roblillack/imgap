@@ -330,6 +330,11 @@ struct InteractiveCache {
 const INTERACTIVE_TOP_ROWS: u16 = 1;
 /// Reserve 3 bottom rows for spacer + slider + help.
 const INTERACTIVE_BOTTOM_ROWS: u16 = 3;
+/// Conservative Sixel raster cap. Matches xterm's default `maxGraphicSize`,
+/// so a 2-up canvas at this size displays in essentially every Sixel-capable
+/// terminal without tripping per-image or per-sequence buffer limits.
+const MAX_SIXEL_W: u32 = 1000;
+const MAX_SIXEL_H: u32 = 1000;
 
 fn compute_interactive_cache(
     img1: &DynamicImage,
@@ -349,7 +354,12 @@ fn compute_interactive_cache(
             let cell_h = (fh / rows.max(1) as u32).max(1);
             let cell_w = (fw / cols.max(1) as u32).max(1);
             let usable_px_h = usable_rows as u32 * cell_h;
-            (fw, usable_px_h, cell_h, cell_w)
+            let (w_px, h_px) = if matches!(protocol, Protocol::Sixel) {
+                (fw.min(MAX_SIXEL_W), usable_px_h.min(MAX_SIXEL_H))
+            } else {
+                (fw, usable_px_h)
+            };
+            (w_px, h_px, cell_h, cell_w)
         }
     };
 
