@@ -16,7 +16,7 @@ The diff heatmap shows pixel differences using a color scale: black (identical) 
 imgap <image1> <image2>
 ```
 
-Supports PNG, JPG, WebP, GIF, BMP, TIFF, and other common formats.
+Supports PNG, JPG, WebP, GIF, BMP, TIFF, SVG, and other common formats.
 
 ### Interactive mode
 
@@ -71,6 +71,7 @@ In your repository (or globally in `~/.config/git/attributes`):
 *.webp diff=image
 *.bmp diff=image
 *.gif diff=image
+*.svg diff=image
 ```
 
 ### 3. Use an image-aware pager
