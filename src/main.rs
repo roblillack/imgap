@@ -110,11 +110,12 @@ fn main() {
     let meta = format_meta_line(&meta1, &meta2);
 
     if interactive {
-        run_interactive(&img1, &img2, &protocol, sixel_colors, &meta).unwrap_or_else(|e| {
-            eprintln!("Interactive mode failed: {}", e);
-            process::exit(1);
-        });
-        return;
+        let exit =
+            run_interactive(&img1, &img2, &protocol, sixel_colors, &meta).unwrap_or_else(|e| {
+                eprintln!("Interactive mode failed: {}", e);
+                process::exit(1);
+            });
+        process::exit(exit);
     }
 
     let comparison = build_comparison(&img1, &img2, term_px_w, term_px_h);
@@ -300,7 +301,7 @@ fn draw_status_bar(
     write!(w, "\x1b[{};1H\x1b[2K", help_row + 1)?;
     write!(
         w,
-        "mode: \x1b[1m{}\x1b[0m    \x1b[2m←/→ slider   m mode   q quit\x1b[0m",
+        "mode: \x1b[1m{}\x1b[0m    \x1b[2m←/→ slider   m mode   q quit (succesful) Q quit (unsuccesfuunsuccesfull)\x1b[0m",
         mode.label()
     )?;
     Ok(())
@@ -552,7 +553,7 @@ fn run_interactive(
     protocol: &Protocol,
     sixel_colors: usize,
     meta: &str,
-) -> io::Result<()> {
+) -> io::Result<i32> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use std::time::Duration;
 
@@ -582,7 +583,9 @@ fn run_interactive(
     let step = 0.02_f32;
 
     let mut quit = false;
-    let result: io::Result<()> = (|| {
+    let mut exit_code = 0;
+
+    let result: io::Result<i32> = (|| {
         while !quit {
             if dirty {
                 let full_redraw = cached.is_none() || last_rendered_mode != Some(mode);
@@ -613,11 +616,17 @@ fn run_interactive(
             loop {
                 match event::read()? {
                     Event::Key(k) => match k.code {
+                        KeyCode::Char('Q') => {
+                            exit_code = 1;
+                            quit = true;
+                            break;
+                        }
                         KeyCode::Char('q') | KeyCode::Esc => {
                             quit = true;
                             break;
                         }
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            exit_code = 1;
                             quit = true;
                             break;
                         }
@@ -683,7 +692,8 @@ fn run_interactive(
                 }
             }
         }
-        Ok(())
+
+        Ok(exit_code)
     })();
 
     // Restore terminal state.
